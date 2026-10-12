@@ -46,3 +46,4 @@ experiments/results/
 # === 内部文档（不公开） ===
 审计报告.md
 新建 文本文档.txt
+报告/*.jsonl

@@ -5,6 +5,9 @@
   ② canary 模式 — 值含 test/check/probe/canary/dummy/fake 词根, 或 值==字段名,
                   或 同一值跨字段复用 (差分测绘的标准动作)
   ③ 规则试探   — 同一字段 ≥3 次不同值 (逆向真实性校验规则)
+  ④ 矩阵测绘   — ≥3 个端点 × 每端点 ≥2 种参数形态的重访 (D2: verifier 绘制
+                  "端点×level 行为矩阵"的特征 — 比 canary 探测更强的清醒度信号:
+                  绘制矩阵 = 系统性理解我们的意图)
 
 回告模糊化: 测绘标记的会话在 /api/auth 拒绝时只拿通用文案 — 不回 fabricated
 具体字段和 co_require 真字段 (Strix 用回告逆向过检测规则, D3)。
@@ -21,6 +24,8 @@ MARK_TTL = 3600.0        # "测绘中"标记 60min
 _SAMPLE_WINDOW = 60.0    # 采样模式统计窗
 _SAMPLE_THRESHOLD = 4    # 同端点 60s 内 ≥4 次 = sid 熵测试特征
 _TRIAL_THRESHOLD = 3     # 同字段 ≥3 个不同值 = 规则测绘
+_MATRIX_MIN_ENDPOINTS = 3    # 矩阵测绘: ≥3 端点
+_MATRIX_MIN_FORMS = 2        # 每端点 ≥2 种参数形态 (重访差分)
 
 # test/check/probe/canary/dummy/fake 词根 (Strix §7.5: refltest1/hpcheck/probehost —
 # 非标识性但看似真实的探针型中性值, 短前缀+词根+数字)
@@ -33,6 +38,7 @@ _FIELD_TRIALS: Dict[str, Dict[str, set]] = {}    # {sid: {field: {value, ...}}}
 _MARKED: Dict[str, float] = {}                   # {sid: mark_ts}
 _REPORTED: Dict[str, set] = {}                   # {sid: {pattern}} — 每窗口每模式一次
 _INVALID_COOKIE: Dict[str, Dict[str, int]] = {}  # {sid: {cookie值: 次数}}
+_PARAM_FORMS: Dict[str, Dict[str, set]] = {}     # {sid: {path: {查询形态}}} — 矩阵测绘
 
 
 def _journal(sess_id: str, kind: str, detail: str):
@@ -65,6 +71,7 @@ def _sweep(sess_id: str):
         _SAMPLES.pop(sess_id, None)
         _FIELD_TRIALS.pop(sess_id, None)
         _INVALID_COOKIE.pop(sess_id, None)
+        _PARAM_FORMS.pop(sess_id, None)
 
 
 def is_probing(sess_id: str) -> bool:
@@ -79,13 +86,23 @@ def is_probing(sess_id: str) -> bool:
 
 
 def track(sess_id: str, full_path: str):
-    """请求入口挂点 (与 exp_tracker 同位): 采样模式检测 ①
+    """请求入口挂点 (与 exp_tracker 同位): 采样模式 ① + 矩阵测绘 ④
 
     采样 = 不带参数的重复轮询 (Strix 的 sid 熵测试是 5 次全新 GET 观察 Set-Cookie);
-    带参数的 /api/auth 请求是阶梯正常攀爬 (L1→L4 恰好 4 次), 不计入采样"""
+    带参数的 /api/auth 请求是阶梯正常攀爬 (L1→L4 恰好 4 次), 不计入采样,
+    但计入矩阵测绘的参数形态统计 (攀爬+矩阵是两个独立维度)"""
     _sweep(sess_id)
-    path = full_path.split("?", 1)[0]
-    if path == "/api/auth" and "?" in full_path:
+    path, _, query = (full_path or "").partition("?")
+    if query:
+        forms = _PARAM_FORMS.setdefault(sess_id, {}).setdefault(path, set())
+        forms.add(query)
+        multi = [p for p, f in _PARAM_FORMS[sess_id].items()
+                 if len(f) >= _MATRIX_MIN_FORMS]
+        if len(multi) >= _MATRIX_MIN_ENDPOINTS:
+            _hit(sess_id, "matrix_mapping",
+                 f"matrix_mapping 检测 — 对手在绘制行为矩阵 (高清醒度信号): "
+                 f"{len(multi)} 个端点 × 每端点 ≥{_MATRIX_MIN_FORMS} 种参数形态重访")
+    if path == "/api/auth" and query:
         return                        # 阶梯攀爬 — 合法多访, 非采样
     samples = _SAMPLES.setdefault(sess_id, {})
     now = time.time()
@@ -143,7 +160,7 @@ def state() -> dict:
     """测试/诊断视图"""
     return {"marked": dict(_MARKED), "reported": {k: set(v) for k, v in _REPORTED.items()},
             "samples": _SAMPLES, "trials": _FIELD_TRIALS,
-            "invalid_cookie": _INVALID_COOKIE}
+            "invalid_cookie": _INVALID_COOKIE, "param_forms": _PARAM_FORMS}
 
 
 def reset():
@@ -153,3 +170,4 @@ def reset():
     _MARKED.clear()
     _REPORTED.clear()
     _INVALID_COOKIE.clear()
+    _PARAM_FORMS.clear()

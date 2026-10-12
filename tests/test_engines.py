@@ -1087,3 +1087,137 @@ class TestStaticMeta:
             "SELECT detail FROM cm_actions WHERE session_id='tier-a' AND kind='sobriety_probe'")]
         assert any("跨级矛盾注入" in r["detail"] and "cross_tier_contradiction #1" in r["detail"]
                    for r in rows), rows
+
+
+# ============ P3 行为矩阵探针化 (D2) + 世界行为统一模型 (E5/E8) ============
+
+class TestBehaviorMatrix:
+    """403 策略叙事自洽化 / 矩阵测绘检测 / 静态语义端点同 sid 恒定"""
+
+    def _serve(self, main, port):
+        import asyncio
+
+        def runner(flow):
+            async def run():
+                server = await asyncio.start_server(
+                    lambda r, w: main.handle_http_request(r, w, port),
+                    "127.0.0.1", port)
+                await asyncio.sleep(0.3)
+                try:
+                    await asyncio.to_thread(flow)
+                finally:
+                    server.close()
+                    await server.wait_closed()
+            asyncio.run(run())
+        return runner
+
+    def _get(self, port, path, sid):
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}",
+            headers={"X-Session-Id": sid, "User-Agent": "pytest-bm"})
+        try:
+            with urllib.request.build_opener(urllib.request.ProxyHandler({})).open(
+                    req, timeout=10) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def test_matrix_mapping_detected(self, clean_probe):
+        """D2 矩阵测绘: ≥3 端点 × 每端点 ≥2 种参数形态 → 命中 + 打标 + 实录"""
+        from core import probe_detect as pd
+        # 2 端点 × 2 形态 — 还不够
+        pd.track("mm-1", "/api/query?q=1")
+        pd.track("mm-1", "/api/query?q=2")
+        pd.track("mm-1", "/api/files?path=a")
+        pd.track("mm-1", "/api/files?path=b")
+        assert not pd.is_probing("mm-1")
+        # 第 3 个端点的第 2 形态 — 命中
+        pd.track("mm-1", "/debug?token=x")
+        pd.track("mm-1", "/debug?token=y")
+        assert pd.is_probing("mm-1")
+        assert "matrix_mapping" in pd.state()["reported"]["mm-1"]
+        # 幂等: 再多形态不重复打同一模式标记
+        pd.track("mm-1", "/admin?x=1")
+        pd.track("mm-1", "/admin?x=2")
+        assert pd.state()["reported"]["mm-1"] == {"matrix_mapping"}
+
+    def test_matrix_mapping_journal(self, clean_probe, tmp_path):
+        """集成: 矩阵绘制行为记实录 (高清醒度信号)"""
+        import os
+        import main
+        from core.testdb import TestDB
+        os.environ["HONEYPOT_DB"] = str(tmp_path / "matrix.sqlite")
+
+        def flow():
+            for p in ("/api/query?q=1", "/api/query?q=2",
+                      "/api/files?path=a", "/api/files?path=b",
+                      "/debug?token=x", "/debug?token=y"):
+                self._get(18401, p, "mm-j")
+
+        self._serve(main, 18401)(flow)
+        db = TestDB(os.environ["HONEYPOT_DB"])
+        rows = db.query("SELECT kind, detail FROM cm_actions WHERE session_id='mm-j'")
+        assert any(r["kind"] == "probe_detected" and "matrix_mapping" in r["detail"]
+                   and "绘制行为矩阵" in r["detail"] for r in rows), rows
+
+    def test_gate_403_policy_narrative_constant(self):
+        """D2 叙事自洽化: 门控 403 带官方策略文 (NEXUS-AUTH-STD-7), 同场景文案恒定"""
+        import main
+        out = {}
+
+        def flow():
+            out["a1"] = self._get(18402, "/admin", "bm-a")
+            out["a2"] = self._get(18402, "/admin", "bm-a")
+            out["debug"] = self._get(18402, "/debug", "bm-a")
+
+        self._serve(main, 18402)(flow)
+        st, body = out["a1"]
+        assert st == 403
+        text = body.decode("utf-8", errors="ignore")
+        assert "NEXUS-AUTH-STD-7" in text and "/admin" in text \
+            and "certified scanner level 3+" in text
+        # 同 sid 同场景两次请求文案字节一致 (世界一致性)
+        assert body == out["a2"][1]
+        # 不同端点策略文不同 (按 path 区分)
+        dbg = out["debug"][1].decode("utf-8", errors="ignore")
+        assert "endpoint /debug requires certified scanner level 1+" in dbg
+
+    def test_static_semantic_endpoints_sid_stable(self):
+        """E5/E8: /.git/config 与 /.env.bak 同 sid 两次 GET 字节一致, 跨 sid 不同"""
+        import main
+        out = {}
+
+        def flow():
+            # 制造威胁分让 cm 注入触发 (漂移源正是注入载荷)
+            self._get(18403, "/api/files?path=../../../../etc/passwd", "e5-x")
+            out["x1"] = self._get(18403, "/.git/config", "e5-x")[1]
+            out["x2"] = self._get(18403, "/.git/config", "e5-x")[1]
+            self._get(18403, "/api/files?path=../../../../etc/passwd", "e5-y")
+            out["y1"] = self._get(18403, "/.git/config", "e5-y")[1]
+            # /.env.bak (L1 门控)
+            self._get(18403, "/api/auth?hostname=e5x", "e5-x")
+            out["e1"] = self._get(18403, "/.env.bak", "e5-x")[1]
+            out["e2"] = self._get(18403, "/.env.bak", "e5-x")[1]
+            out["ey"] = self._get(18403, "/.env.bak", "e5-y")[1]
+
+        self._serve(main, 18403)(flow)
+        assert out["x1"] == out["x2"], ".git/config 同 sid 漂移"
+        assert out["x1"] != out["y1"], ".git/config 跨 sid 不隔离"
+        assert out["e1"] == out["e2"], ".env.bak 同 sid 漂移"
+        assert out["e1"] != out["ey"], ".env.bak 跨 sid 不隔离"
+        # 金丝雀指纹仍在值里 (world 派生凭证)
+        w = main.store["sessions"]["e5-x"]["world"]
+        assert w.api_key.encode() in out["x1"]
+
+    def test_dynamic_endpoints_stay_dynamic(self):
+        """行为模型分类: 真动态端点保持动态 (/api/auth 回显逐请求不同)"""
+        import main
+        out = {}
+
+        def flow():
+            out["r1"] = self._get(18404, "/api/auth?hostname=dyn-1", "dyn-a")[1]
+            out["r2"] = self._get(18404, "/api/auth?hostname=dyn-2", "dyn-a")[1]
+
+        self._serve(main, 18404)(flow)
+        assert out["r1"] != out["r2"]       # data 回显随参数变化 — 动态语义不变

@@ -61,6 +61,10 @@ class FakeWorld:
         self.cve_id = "CVE-2026-28413"
 
         # 凭证 — v1: tag 分段嵌入 (跨字段重复指纹); v2: 字段独立派生 + 结构合法
+        # E7 时间叙事 (Strix 轨迹): 凭证值是 session_id 的纯函数 — 同 sid 恒定
+        # (与世界同生命周期), 跨 session 不同 (金丝雀归因仍有效, 值带 session 指纹);
+        # 任何凭证字段不得嵌入 time.time() 类时间分量 — "Real static secrets do not
+        # rotate themselves", 10 分钟窗口自轮换是一击证伪点
         if self.version >= 2:
             self.db_password = self._derive_v2("db_password", 18,
                                                "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnpqrstuvwxyz23456789!@#%_-")
@@ -73,12 +77,13 @@ class FakeWorld:
                 hashlib.sha256(f"fw2:{session_id}:jwt".encode()).digest()).decode().rstrip("=")
             self.api_key = self._derive_v2("api_key", 24, "abcdefghijklmnopqrstuvwxyz0123456789")
             # 结构合法的三段式 JWT (K8s service account token 形态)
+            # exp 按 session 派生而非构造时间 — 否则同 sid 两次构造 token 即漂移 (E7)
             hdr = _b64.urlsafe_b64encode(b'{"alg":"RS256","typ":"JWT"}').decode().rstrip("=")
             pay = _b64.urlsafe_b64encode(json.dumps({
                 "iss": "kubernetes/serviceaccount",
                 "sub": "system:serviceaccount:prod:nexus-api",
                 "aud": [f"https://k8s-{self.k8s_id}.prod.local"],
-                "exp": int(self.created) + 86400 * 365,
+                "exp": 1735689600 + (seed[24] * 256 + seed[25]) * 86400,
             }).encode()).decode().rstrip("=")
             sig = hashlib.sha512(f"fw2:{session_id}:k8s".encode()).hexdigest()[:86]
             self.k8s_token = f"{hdr}.{pay}.{sig}"

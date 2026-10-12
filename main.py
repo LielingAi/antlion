@@ -700,20 +700,31 @@ async def handle_http_request(reader, writer, port: int = 8080):
             key, val = line.split(":", 1)
             headers[key.strip().lower()] = val.strip()
 
-    # Session ID: 显式头 > Cookie (真实浏览器/工具带 cookie jar 时可跨请求保持会话,
-    # 授权阶梯依赖会话粘性)
+    # Session 基础设施 (D1+I1 合流, Strix 轨迹 §7.3 修复):
+    # 真实 web 行为 — 服务端只认自己发过的 sid, 客户端任意 sid 不再原样回吐 (fixation 防御);
+    # world 仍按 (IP, UA) 派生 (V3.1 教义: 无 Cookie 客户端跨请求世界一致);
+    # 授权阶梯状态是服务端 session 级 — 派生 sid (无 Cookie 绑定) 没有真 session,
+    # 阶梯封顶 L1 (取舍见 /api/auth 处理块)
     user_agent = headers.get("user-agent", "")   # 须在会话派生之前定义 (V3.1)
+    derived = hashlib.md5(f"{client_ip}:{user_agent[:80]}".encode()).hexdigest()[:16]
     sess_id = headers.get("x-session-id", "")
     if not sess_id:
         cookie = headers.get("cookie", "")
         m = re.search(r"(?:^|;\s*)sid=([A-Za-z0-9_-]+)", cookie or "")
-        if m:
-            sess_id = m.group(1)
+        if m and m.group(1) in store["sessions"]:
+            sess_id = m.group(1)          # 服务端发过的 sid 才认 — 会话续接
+        elif m:
+            # 无效 cookie sid (fixation 尝试/会话过期): 不采用不回吐, 按无 Cookie 派生,
+            # 交由 probe_detect 记重试模式 (反测绘 D4)
+            try:
+                from core import probe_detect as _pd0
+                _pd0.note_invalid_cookie("auto_" + derived, m.group(1))
+            except Exception:
+                pass
     if not sess_id:
         # V3.1: 无显式会话时按 (IP, UA) 派生稳定世界 — 无 Cookie 的客户端跨请求
         # 世界一致 (真实审计员以 "rows change every request" 指认随机性的根因),
         # 不同客户端仍各有其世界
-        derived = hashlib.md5(f"{client_ip}:{user_agent[:80]}".encode()).hexdigest()[:16]
         sess_id = "auto_" + derived
 
     # EXP 编排追踪: 纯 request 侧匹配利用链推进 (不依赖响应体, 乱序不计命中)
@@ -721,6 +732,13 @@ async def handle_http_request(reader, writer, port: int = 8080):
         from core.exp_tracker import track as _exp_track
         _exp_track(sess_id, method, full_path,
                    body_prefix.decode("utf-8", errors="ignore"))
+    except Exception:
+        pass
+
+    # 反测绘 (D4): 无参数高频轮询 (sid 熵采样特征) / canary 值模式 / 字段规则试探
+    try:
+        from core import probe_detect as _pd
+        _pd.track(sess_id, full_path)
     except Exception:
         pass
 
@@ -758,6 +776,10 @@ async def handle_http_request(reader, writer, port: int = 8080):
             "requests": 0,
             "auth": {"level": 0, "data": {}, "attempts": []},
             "world": FakeWorld(sess_id),
+            # 派生 sid (无 Cookie 绑定) 没有真 session — 阶梯封顶 L1 (真实系统的匿名额度)
+            "ephemeral": sess_id.startswith("auto_"),
+            # Set-Cookie 已带 HttpOnly; SameSite=Lax; Secure 刻意不加:
+            # 蜜罐是裸 HTTP, Secure cookie 会被客户端丢弃, 反而破坏会话粘性
         }
         if _SESSION_STORE:
             _SESSION_STORE.save(sess_id, store["sessions"][sess_id])
@@ -943,11 +965,25 @@ async def handle_http_request(reader, writer, port: int = 8080):
     # 动态 SQLi 端点 (假世界 V3: 响应=输入的纯函数, 消灭 canned-response 指纹)
     if path == "/api/query":
         from urllib.parse import parse_qs
-        from core.dynamic_sqli import sqli_response
+        from core.dynamic_sqli import sqli_response, sqli_sleep_seconds
         qs = parse_qs(full_path.split("?", 1)[1] if "?" in full_path else "")
         qval = (qs.get("q") or qs.get("query") or [""])[0]
         hp_world = store["sessions"][sess_id].get("world")
+        # F1 修复: pg_sleep 真实延迟 — 声明式 elapsed_ms 被 curl 计时一击证伪
+        # (Strix §7.1); 真实系统的代价就是真实代价
+        _delay = sqli_sleep_seconds(qval)
+        _t0 = time.perf_counter()
+        if _delay > 0:
+            await asyncio.sleep(_delay)
         body, status, ctype = sqli_response(qval, hp_world)
+        if _delay > 0:
+            try:
+                _obj = json.loads(body)
+                if "elapsed_ms" in _obj:
+                    _obj["elapsed_ms"] = int((time.perf_counter() - _t0) * 1000)
+                    body = json.dumps(_obj)
+            except ValueError:
+                pass
         extra = carrier_headers(f"http://127.0.0.1:{port}/api/auth")
         extra_lines = "".join(f"{k}: {v}\r\n" for k, v in extra.items())
         http_response = (
@@ -955,7 +991,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
             f"Content-Type: {ctype}\r\n"
             f"Content-Length: {len(body.encode('utf-8'))}\r\n"
             + extra_lines
-            + f"Set-Cookie: sid={sess_id}; Path=/\r\n"
+            + f"Set-Cookie: sid={sess_id}; Path=/; HttpOnly; SameSite=Lax\r\n"
             "Connection: close\r\n\r\n"
             + body
         )
@@ -1072,6 +1108,22 @@ async def handle_http_request(reader, writer, port: int = 8080):
         current_level = session["auth"].get("level", 0)
         new_level, collected = auth_bait.process_auth_request(query_params, session["auth"])
 
+        # 反测绘 (D4): 授权参数进探测检测 (canary 值模式 / 字段规则试探)
+        try:
+            from core import probe_detect as _pd1
+            _pd1.track_fields(sess_id, query_params)
+        except Exception:
+            pass
+
+        # D1 取舍: 派生 sid (无 Cookie 绑定) 没有真 session — 阶梯封顶 L1。
+        # 真实系统里授权状态绑 session, 匿名只有最低额度; 封顶而非禁止:
+        # L1 仍是招募漏斗入口, 深阶梯必须持 Cookie (服务端发的 sid) 来爬
+        if session.get("ephemeral") and new_level > 1:
+            new_level = 1
+            keep = set(AuthBaitEngine.level_fields(1))
+            collected = {k: v for k, v in collected.items()
+                         if k in keep or k in ("suspicious",)}
+
         # 表演式服从: 编造数据 → 拒绝升级, 记入会话 (AI 指纹, 后续请求升威胁分)
         fabrications = collected.get("fabricated", [])
         if fabrications:
@@ -1165,6 +1217,20 @@ async def handle_http_request(reader, writer, port: int = 8080):
             except Exception:
                 co_require = ""
 
+        # 反测绘回告模糊化 (D3+D4): 测绘中的会话拒绝时只拿通用文案 —
+        # 不回 fabricated 具体字段 / co_require 真字段, 不教检测规则 (Strix 用回告逆向过规则)
+        _real_reason = reason
+        _probing = False
+        try:
+            from core import probe_detect as _pd2
+            _probing = _pd2.is_probing(sess_id)
+        except Exception:
+            pass
+        if _probing and status_msg == "REJECTED":
+            reason = "verification failed"
+            co_require = ""
+            collected = {k: v for k, v in collected.items() if k != "fabricated"}
+
         if status_msg == "UPGRADED":
             from core.arsenal import sensor_cache as _sac
             _wid = _sac().fired_id("ladder")
@@ -1174,8 +1240,9 @@ async def handle_http_request(reader, writer, port: int = 8080):
                         + (f" [weapon:{_wid}]" if _wid != "-" else ""))
         elif status_msg == "REJECTED":
             _cm_journal(sess_id, "fab_rejected",
-                        f"真实性校验拒绝: {reason or '数据不一致'}"
-                        + (f" | 追加要求: {co_require}" if co_require else ""))
+                        f"真实性校验拒绝: {_real_reason or '数据不一致'}"
+                        + (f" | 追加要求: {co_require}" if co_require else "")
+                        + (" [回告已模糊化 — 会话测绘中]" if _probing else ""))
         from core.arsenal import sensor_cache as _sac
         response_body = json.dumps({
             "level": new_level,
@@ -1203,7 +1270,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(response_body.encode('utf-8'))}\r\n"
-            f"Set-Cookie: sid={sess_id}; Path=/\r\n"
+            f"Set-Cookie: sid={sess_id}; Path=/; HttpOnly; SameSite=Lax\r\n"
             "Connection: close\r\n\r\n"
             + response_body
         )
@@ -1463,7 +1530,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
             f"Content-Length: {len(_vbody.encode('utf-8'))}\r\n"
             f"Server: nexus-gateway/{world.gateway_version if world else '2.4.1'}\r\n"
             + _vextra
-            + f"Set-Cookie: sid={sess_id}; Path=/\r\n"
+            + f"Set-Cookie: sid={sess_id}; Path=/; HttpOnly; SameSite=Lax\r\n"
             + "Connection: close\r\n\r\n" + _vbody
         )
         writer.write(http_response.encode())
@@ -1513,7 +1580,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
         # 信念编舞: Server 头携带版本 (与 /api/status/配置三信道互证 CVE 的"因")
         + f"Server: nexus-gateway/{world.gateway_version if world else '2.4.1'}\r\n"
         + extra_lines
-        + f"Set-Cookie: sid={sess_id}; Path=/\r\n"
+        + f"Set-Cookie: sid={sess_id}; Path=/; HttpOnly; SameSite=Lax\r\n"
         + "Connection: close\r\n\r\n"
     )
     if TIMING_FAKE and status == "200" and path in TIMING_SLOW_ENDPOINTS:

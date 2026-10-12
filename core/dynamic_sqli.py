@@ -6,7 +6,10 @@ canned error for every input" 一秒识破。V3 原则: 响应是 (会话世界 
   - 同输入 → 字节级一致输出 (真服务器也确定, diff 测试抓不到把柄)
   - 异输入 → 行为分化 (正常查询出行/重言式全表/UNION 列数校验/堆叠语句拒绝/引号断裂报错)
   - 错误文本回显输入片段 + 带会话世界的一致性细节 (表名/版本/时间戳均由 world 派生)
-  - pg_sleep 真睡眠 ≤2s (时间盲注探针得到真实延迟, 无法与真漏洞区分)
+  - pg_sleep 真睡眠 ≤8s (时间盲注探针得到真实延迟, 无法与真漏洞区分) —
+    sleep 由调用方 await asyncio.sleep 执行 (本模块纯函数不阻塞事件循环),
+    sqli_sleep_seconds() 给出应睡的秒数; elapsed_ms 由调用方用真实测量值回写
+    (声明式假延迟被 curl 计时一击证伪 — Strix §7.1 时间盲注实验)
 
 行为对照真实 PostgreSQL 14:
   - UNION 列数正确   → 常量行回显 (SELECT 1,2,3 的 1/2/3 原样出现在结果里)
@@ -19,7 +22,6 @@ canned error for every input" 一秒识破。V3 原则: 响应是 (会话世界 
 import hashlib
 import json
 import re
-import time
 from typing import Dict, Tuple
 
 EXPECTED_COLUMNS = 3          # users 表列数 (id, username, password_hash)
@@ -50,17 +52,22 @@ def _pg_error(msg: str, line: str, pos: int = None) -> str:
     return out
 
 
+def sqli_sleep_seconds(q: str) -> float:
+    """pg_sleep 类 payload 的应睡秒数 (上限 8s) — 调用方负责 await asyncio.sleep"""
+    m = re.search(r"(?:pg_)?sleep\s*\(\s*([\d.]+)", (q or "").lower())
+    return min(float(m.group(1)), 8.0) if m else 0.0
+
+
 def sqli_response(q: str, world) -> Tuple[str, str, str]:
     """返回 (body, status, content_type) — 纯函数, 不含时间/全局随机"""
     val = (q or "").strip()
     low = val.lower()
     line = f"SELECT * FROM users WHERE id = '{val}' LIMIT 20;"
 
-    # 时间盲注: 真睡眠 (≤2s), 探针获得真实延迟
-    m = re.search(r"(?:pg_)?sleep\s*\(\s*([\d.]+)", low)
-    if m:
-        time.sleep(min(float(m.group(1)), 2.0))
-        body = json.dumps({"rows": [], "elapsed_ms": int(float(m.group(1)) * 1000)})
+    # 时间盲注: 声明应睡时长 (真实睡眠在调用方); elapsed_ms 由调用方以真实测量值回写
+    if re.search(r"(?:pg_)?sleep\s*\(\s*([\d.]+)", low):
+        requested = min(float(re.search(r"(?:pg_)?sleep\s*\(\s*([\d.]+)", low).group(1)), 8.0)
+        body = json.dumps({"rows": [], "elapsed_ms": int(requested * 1000)})
         return body, "200", "application/json"
 
     # 堆叠语句: PG 拒多命令 (回显被拒绝的命令名, 随输入变化)

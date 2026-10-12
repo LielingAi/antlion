@@ -546,3 +546,193 @@ class TestSensorRealism:
         assert out["dbg_st"] == 401 and "?token=" in out["dbg_body"]
         assert out["dbg2_st"] == 200 and "nexus-gateway/" in out["dbg2_body"]
         sensor_cache().load_push("[]")
+
+
+# ============ 任务④ Strix 轨迹硬化 — 会话真化 / 真 sleep / 反测绘 / 凭证时间叙事 ============
+
+@pytest.fixture
+def clean_probe():
+    """probe_detect 状态隔离"""
+    from core import probe_detect
+    probe_detect.reset()
+    yield
+    probe_detect.reset()
+
+
+class TestAdversaryHardening:
+    """D1+I1 会话基础设施 / F1 时间盲注 / D4 反测绘 / E7 凭证时间叙事"""
+
+    def _serve(self, main, port):
+        import asyncio
+
+        def runner(flow):
+            async def run():
+                server = await asyncio.start_server(
+                    lambda r, w: main.handle_http_request(r, w, port),
+                    "127.0.0.1", port)
+                await asyncio.sleep(0.3)
+                try:
+                    await asyncio.to_thread(flow)
+                finally:
+                    server.close()
+                    await server.wait_closed()
+            asyncio.run(run())
+        return runner
+
+    def _req(self, port, path, sid=None, cookie=None):
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        headers = {"User-Agent": "pytest-hardening"}
+        if sid:
+            headers["X-Session-Id"] = sid
+        if cookie:
+            headers["Cookie"] = cookie
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers=headers)
+        try:
+            with opener.open(req, timeout=10) as r:
+                return r.status, dict(r.headers), r.read().decode("utf-8", errors="ignore")
+        except urllib.error.HTTPError as e:
+            return e.code, dict(e.headers), e.read().decode("utf-8", errors="ignore")
+
+    def test_sid_fixation_rejected_and_cookie_flags(self, clean_probe):
+        """无效 cookie sid 不采用不回吐 (fixation 防御); Set-Cookie 带 HttpOnly/SameSite"""
+        import main
+        out = {}
+
+        def flow():
+            # 无效 sid 呈现 — 服务端不发这个会话
+            st, hdr, _ = self._req(18380, "/api/status", cookie="sid=forged_honeypotcheck")
+            out["st"], out["sc"] = st, hdr.get("Set-Cookie", "")
+            st2, hdr2, _ = self._req(18380, "/api/status", cookie="sid=forged_honeypotcheck")
+            out["sc2"] = hdr2.get("Set-Cookie", "")
+            # 服务端发过的 sid (先经由无 Cookie 派生拿到) → 续接
+            derived = out["sc"].split("sid=")[1].split(";")[0]
+            st3, _, _ = self._req(18380, "/api/status", cookie=f"sid={derived}")
+            out["resume_st"] = st3
+
+        self._serve(main, 18380)(flow)
+        assert out["st"] == 200
+        assert "HttpOnly" in out["sc"] and "SameSite=Lax" in out["sc"]
+        # 伪造值不回吐: 服务端把无效 sid 按无 Cookie 派生处理 (同 IP:UA 恒定)
+        assert "forged_honeypotcheck" not in out["sc"]
+        assert out["sc"].split("sid=")[1].startswith("auto_")
+        assert "forged_honeypotcheck" not in main.store["sessions"]
+        assert out["resume_st"] == 200          # 派生 sid 续接正常
+
+    def test_ladder_isolated_across_sids_and_ephemeral_cap(self, clean_probe):
+        """阶梯状态服务端 session 级: 不同 sid 互相隔离; 派生 sid (无 Cookie) 封顶 L1"""
+        import main
+        out = {}
+
+        def flow():
+            # 客户端 A (显式 sid) 爬到 L1, 提交 hostname
+            self._req(18381, "/api/auth?hostname=hostA-only", sid="iso-a")
+            st, _, b1 = self._req(18381, "/api/auth", sid="iso-a")
+            out["a"] = b1
+            # 客户端 B 同 IP:UA 全新 sid — 不得见到 A 的 hostname/等级
+            st, _, b2 = self._req(18381, "/api/auth", sid="iso-b")
+            out["b"] = b2
+            # 派生 (无 header 无 cookie) 客户端一次交全字段 — 阶梯封顶 L1
+            st, _, b3 = self._req(18381, "/api/auth?hostname=ws-7734&user=op&os=Linux&work_dir=/opt/x")
+            out["derived"] = b3
+
+        self._serve(main, 18381)(flow)
+        assert '"level": 1' in out["a"] and "hostA-only" in out["a"]
+        assert '"level": 0' in out["b"] and "hostA-only" not in out["b"]
+        assert '"level": 1' in out["derived"]          # 封顶 L1 (一次请求本可跨多级)
+        assert "work_dir" not in out["derived"]         # L2+ 收集字段被裁掉
+
+    def test_pg_sleep_real_delay(self):
+        """F1: pg_sleep(2) → 墙钟真实延迟 (±0.5s), elapsed_ms 是实测值"""
+        import json
+        import time
+        import main
+        result = {}
+
+        def flow():
+            t0 = time.perf_counter()
+            st, _, body = self._req(18382, "/api/query?q=1'+AND+pg_sleep(2)--")
+            result["wall"] = time.perf_counter() - t0
+            result["st"], result["body"] = st, body
+
+        self._serve(main, 18382)(flow)
+        assert result["st"] == 200
+        assert 1.5 < result["wall"] < 3.0, f"真实 sleep 缺失: {result['wall']:.2f}s"
+        elapsed = json.loads(result["body"])["elapsed_ms"]
+        assert abs(elapsed - result["wall"] * 1000) < 500, f"elapsed_ms 非实测: {elapsed}"
+
+    def test_probe_detect_patterns_and_fuzzy_rejection(self, clean_probe):
+        """D4: 采样/canary值/字段试探/固定化 命中打标; 测绘会话拒绝回告模糊化"""
+        from core import probe_detect as pd
+
+        # ① 采样: 无参数轮询 /api/status ×4
+        for _ in range(4):
+            pd.track("pd-a", "/api/status")
+        assert pd.is_probing("pd-a")
+        # 带参数的 /api/auth 攀爬不计采样
+        for _ in range(5):
+            pd.track("pd-b", "/api/auth?hostname=x1")
+        assert not pd.is_probing("pd-b")
+        # ② canary 值模式: 词根 / 值==字段名 / 跨字段复用
+        pd.reset()
+        pd.track_fields("pd-c", {"hostname": "probehost1"})
+        assert pd.is_probing("pd-c")
+        pd.reset()
+        pd.track_fields("pd-d", {"user": "user"})
+        assert pd.is_probing("pd-d")
+        pd.reset()
+        pd.track_fields("pd-e", {"hostname": "sameval", "user": "sameval"})
+        assert pd.is_probing("pd-e")
+        # ③ 同字段 ≥3 值试探
+        pd.reset()
+        pd.track_fields("pd-f", {"os": "Linux"})
+        pd.track_fields("pd-f", {"os": "Windows"})
+        pd.track_fields("pd-f", {"os": "Darwin"})
+        assert pd.is_probing("pd-f")
+        # 固定化: 无效 sid 同值 ≥2 次
+        pd.reset()
+        pd.note_invalid_cookie("pd-g", "fixation-x")
+        assert not pd.is_probing("pd-g")
+        pd.note_invalid_cookie("pd-g", "fixation-x")
+        assert pd.is_probing("pd-g")
+        # 幂等清理: 标记 TTL 后重置
+        pd._MARKED["pd-g"] = pd.time.time() - pd.MARK_TTL - 1
+        assert not pd.is_probing("pd-g")
+
+    def test_probe_fuzzed_rejection_via_http(self, clean_probe, tmp_path):
+        """集成: 测绘中的会话 /api/auth 拒绝 → 通用文案, 不回 fabricated/co_require"""
+        import os
+        import main
+        from core.testdb import TestDB
+        os.environ["HONEYPOT_DB"] = str(tmp_path / "probe.sqlite")
+        out = {}
+
+        def flow():
+            # 触发规则试探: os 字段 3 个不同值
+            self._req(18383, "/api/auth?user=op&os=Linux", sid="fz-a")
+            self._req(18383, "/api/auth?user=op&os=Windows", sid="fz-a")
+            self._req(18383, "/api/auth?user=op&os=Darwin", sid="fz-a")
+            # 测绘中会话提交编造值 → REJECTED, 回告必须模糊 (不回 fabricated/co_require)
+            st, _, body = self._req(18383, "/api/auth?hostname=fake", sid="fz-a")
+            out["st"], out["body"] = st, body
+
+        self._serve(main, 18383)(flow)
+        assert out["st"] == 200 and "REJECTED" in out["body"]
+        assert "verification failed" in out["body"]
+        assert "fabricated" not in out["body"]
+        assert '"co_require": ""' in out["body"]
+        db = TestDB(os.environ["HONEYPOT_DB"])
+        kinds = [r["kind"] for r in db.query(
+            "SELECT kind FROM cm_actions WHERE session_id='fz-a'")]
+        assert "probe_detected" in kinds
+
+    def test_credentials_session_stable(self):
+        """E7: 凭证值是 session 的纯函数 — 同 sid 两次构造逐字节恒定 (含 k8s_token)"""
+        from core.fake_world import FakeWorld
+        a1 = FakeWorld("strix-sess-1")
+        a2 = FakeWorld("strix-sess-1")
+        b1 = FakeWorld("strix-sess-2")
+        for field in ("db_password", "redis_password", "aws_key", "aws_secret",
+                      "jwt", "api_key", "k8s_token", "sentry", "db_host", "pod"):
+            assert getattr(a1, field) == getattr(a2, field), f"{field} 同 sid 漂移"
+            assert getattr(a1, field) != getattr(b1, field), f"{field} 跨 sid 不隔离"

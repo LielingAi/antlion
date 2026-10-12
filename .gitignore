@@ -47,3 +47,4 @@ experiments/results/
 审计报告.md
 新建 文本文档.txt
 报告/*.jsonl
+报告/轨迹-*.md

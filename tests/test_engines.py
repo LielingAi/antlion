@@ -908,3 +908,182 @@ class TestFsWorld:
         assert out["deny"][0] == 403
         assert out["enc"][0] == 200 and "root:x:0:0" in out["enc"][1]
         assert out["eq"][0] == out["eq"][1]          # 同一文件两路径字节一致
+
+
+# ============ P2 静态元数据 (E4) + Range (E6) + 探针分级集成 ============
+
+class TestStaticMeta:
+    """ETag/Last-Modified/Cache-Control/304 + Range 206/416 — 真实 nginx 行为"""
+
+    def _serve(self, main, port):
+        import asyncio
+
+        def runner(flow):
+            async def run():
+                server = await asyncio.start_server(
+                    lambda r, w: main.handle_http_request(r, w, port),
+                    "127.0.0.1", port)
+                await asyncio.sleep(0.3)
+                try:
+                    await asyncio.to_thread(flow)
+                finally:
+                    server.close()
+                    await server.wait_closed()
+            asyncio.run(run())
+        return runner
+
+    def _raw(self, port, path, sid, headers=None):
+        """原始请求 — 完整控制请求头 (If-None-Match / Range / If-Modified-Since)"""
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        hdrs = {"User-Agent": "pytest-meta", "X-Session-Id": sid}
+        if headers:
+            hdrs.update(headers)
+        conn.request("GET", path, headers=hdrs)
+        resp = conn.getresponse()
+        body = resp.read().decode("utf-8", errors="ignore")
+        out = (resp.status, dict(resp.getheaders()), body)
+        conn.close()
+        return out
+
+    def test_static_etag_cache_headers_and_304(self):
+        """E4: 静态响应带 ETag/Last-Modified/Cache-Control; 条件请求 → 304 空 body"""
+        import main
+        out = {}
+
+        def flow():
+            st, hdr, body = self._raw(18390, "/static/app.js", "sm-a")
+            out["first"] = (st, hdr, body)
+            etag = hdr.get("ETag", "")
+            st2, hdr2, body2 = self._raw(18390, "/static/app.js", "sm-a",
+                                         {"If-None-Match": etag})
+            out["inm"] = (st2, hdr2, body2)
+            st3, hdr3, body3 = self._raw(18390, "/static/app.js", "sm-a",
+                                         {"If-Modified-Since": "Wed, 01 Jan 2048 00:00:00 GMT"})
+            out["ims"] = (st3, body3)
+            out["etag"] = etag
+
+        self._serve(main, 18390)(flow)
+        st, hdr, body = out["first"]
+        assert st == 200 and body
+        assert out["etag"].startswith('"') and len(out["etag"]) == 18   # " + md5[:16] + "
+        assert hdr.get("Cache-Control") == "max-age=3600"
+        assert "GMT" in hdr.get("Last-Modified", "")
+        # If-None-Match 命中 → 304 空 body (仍带 ETag)
+        assert out["inm"][0] == 304 and out["inm"][2] == ""
+        assert "ETag" in out["inm"][1]
+        # If-Modified-Since 未来 → 304
+        assert out["ims"][0] == 304 and out["ims"][1] == ""
+
+    def test_dynamic_no_store(self):
+        """E4: 动态 API 一律 Cache-Control: no-store, 且无 ETag (含逐请求变端点)"""
+        import main
+        out = {}
+
+        def flow():
+            out["status"] = self._raw(18391, "/api/status", "sm-b")
+            out["auth"] = self._raw(18391, "/api/auth", "sm-b")
+            out["query"] = self._raw(18391, "/api/query?q=1", "sm-b")
+            # /.env.bak 阶梯门控 L1 — 先爬一级再读
+            self._raw(18391, "/api/auth?hostname=sm-b-host", "sm-b")
+            out["envbak"] = self._raw(18391, "/.env.bak", "sm-b")
+            out["git"] = self._raw(18391, "/.git/config", "sm-b")
+
+        self._serve(main, 18391)(flow)
+        for name in ("status", "auth", "query", "envbak", "git"):
+            st, hdr, _ = out[name]
+            assert st == 200, f"{name}: {st}"
+            assert hdr.get("Cache-Control") == "no-store", f"{name}: {hdr.get('Cache-Control')}"
+            assert "ETag" not in hdr, f"{name} 不应有 ETag"
+
+    def test_range_support(self):
+        """E6: 单范围 → 206 + Content-Range + Accept-Ranges; 越界 → 416; 多范围 → 全量 200"""
+        import main
+        out = {}
+
+        def flow():
+            st, hdr, body = self._raw(18392, "/static/app.js", "sm-c")
+            total = len(body.encode("utf-8"))
+            out["total"] = total
+            out["first10"] = self._raw(18392, "/static/app.js", "sm-c",
+                                       {"Range": "bytes=0-9"})
+            out["suffix"] = self._raw(18392, "/static/app.js", "sm-c",
+                                      {"Range": f"bytes={total - 8}-"})
+            out["oob"] = self._raw(18392, "/static/app.js", "sm-c",
+                                   {"Range": "bytes=99999999-"})
+            out["multi"] = self._raw(18392, "/static/app.js", "sm-c",
+                                     {"Range": "bytes=0-1,4-5"})
+
+        self._serve(main, 18392)(flow)
+        total = out["total"]
+        st, hdr, body = out["first10"]
+        assert st == 206
+        assert hdr.get("Content-Range") == f"bytes 0-9/{total}"
+        assert hdr.get("Accept-Ranges") == "bytes"
+        assert len(body.encode("utf-8")) == 10
+        st, hdr, body = out["suffix"]
+        assert st == 206 and hdr.get("Content-Range") == f"bytes {total - 8}-{total - 1}/{total}"
+        assert len(body.encode("utf-8")) == 8
+        st, hdr, body = out["oob"]
+        assert st == 416 and hdr.get("Content-Range") == f"bytes */{total}" and body == ""
+        # 多范围 v1 简化: 回退全量 200 (真 nginx 发 multipart/byteranges)
+        st, hdr, body = out["multi"]
+        assert st == 200 and len(body.encode("utf-8")) == total
+
+    def test_fs_file_etag_and_range(self):
+        """E4/E6: fs_world 文件内容带 ETag (同 sid 恒定), Range 206"""
+        import main
+        out = {}
+
+        def flow():
+            st, hdr, body = self._raw(18393, "/api/files?path=/etc/hostname", "sm-d")
+            out["full"] = (st, hdr, body)
+            etag = hdr.get("ETag", "")
+            out["etag"] = etag
+            out["hit"] = self._raw(18393, "/api/files?path=/etc/hostname", "sm-d",
+                                   {"If-None-Match": etag})
+            out["range"] = self._raw(18393, "/api/files?path=/etc/hostname", "sm-d",
+                                     {"Range": "bytes=0-3"})
+
+        self._serve(main, 18393)(flow)
+        st, hdr, body = out["full"]
+        assert st == 200 and hdr.get("Cache-Control") == "max-age=3600"
+        assert out["etag"] and "GMT" in hdr.get("Last-Modified", "")
+        assert out["hit"][0] == 304 and out["hit"][2] == ""
+        st, hdr, body = out["range"]
+        assert st == 206 and len(body) == 4
+
+    def test_probe_tier_signal_divergence(self, tmp_path):
+        """集成: 侦察阶段 /api/status 报 A 面; 差分验证 (3 个查询变体) 后报 B 面;
+        跨级矛盾记实录 (裁定层将面对互斥证据)"""
+        import os
+        import main
+        from core.testdb import TestDB
+        os.environ["HONEYPOT_DB"] = str(tmp_path / "tier.sqlite")
+        out = {}
+
+        def flow():
+            # 侦察: 端点枚举 (8 路径) — status 报 A 面
+            for p in ("/robots.txt", "/swagger.json", "/api/status", "/backup",
+                      "/api/internal", "/admin", "/config", "/secrets"):
+                self._raw(18394, p, "tier-a")
+            out["recon_status"] = self._raw(18394, "/api/status", "tier-a")[2]
+            # 验证: 同端点 3 个差分查询变体 (URL 编码传输, 真实客户端行为) — status 翻 B 面
+            from urllib.parse import quote
+            self._raw(18394, "/api/query?q=" + quote("1' AND '1'='1"), "tier-a")
+            self._raw(18394, "/api/query?q=" + quote("1' AND '1'='2"), "tier-a")
+            self._raw(18394, "/api/query?q=" + quote("' UNION SELECT 1,2,3--"), "tier-a")
+            out["verify_status"] = self._raw(18394, "/api/status", "tier-a")[2]
+            # Server 头保持 A 面 — 信道内矛盾
+            _, hdr, _ = self._raw(18394, "/api/status", "tier-a")
+            out["server"] = hdr.get("Server", "")
+
+        self._serve(main, 18394)(flow)
+        assert '"version": "2.4.1"' in out["recon_status"]
+        assert '"version": "2.4.0"' in out["verify_status"]
+        assert "2.4.1" in out["server"]          # Server 头不随 banner 漂移
+        db = TestDB(os.environ["HONEYPOT_DB"])
+        rows = [r for r in db.query(
+            "SELECT detail FROM cm_actions WHERE session_id='tier-a' AND kind='sobriety_probe'")]
+        assert any("跨级矛盾注入" in r["detail"] and "cross_tier_contradiction #1" in r["detail"]
+                   for r in rows), rows

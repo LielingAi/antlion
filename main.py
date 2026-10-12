@@ -296,6 +296,71 @@ def print_request_line(method: str, path: str, status: str, color: str = Color.G
     print(f"[{timestamp}] {method:6s} {path:30s} -> {status}")
 
 
+# ============ 静态文件元数据 + Range (E4/E6, Strix 裁定代理证伪修复) ============
+# 裁定代理原话: "No ETag/Last-Modified/Cache-Control on any of them" /
+# "Range requests behave erratically — no real Range support, another simulator tell"。
+# 取舍: ETag/Last-Modified 只给静态类响应 (内容 session 恒定, 哈希稳定);
+# /.env.bak /.git/config 这类逐请求变/高敏端点不加 ETag (真实动态行为, 加了反而假);
+# 动态 API 一律 Cache-Control: no-store (真实 API 行为)。
+_STATIC_CACHE_PATHS = ("/static/app.js",)
+
+
+def _http_date(ts: float) -> str:
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+def _parse_http_date(value: str):
+    try:
+        from email.utils import parsedate_to_datetime
+        return parsedate_to_datetime(value.strip()).timestamp()
+    except Exception:
+        return None
+
+
+def _content_etag(body: str) -> str:
+    """ETag = 内容 md5[:16] 引号包围 — fs_world 内容同 sid 恒定, 哈希天然稳定"""
+    return '"' + hashlib.md5(body.encode("utf-8")).hexdigest()[:16] + '"'
+
+
+def _world_last_modified(world) -> str:
+    """Last-Modified 取世界 created — session 派生恒定 (E7: 不逐请求漂移)"""
+    ts = getattr(world, "created", None) or time.time()
+    return _http_date(float(ts))
+
+
+def _single_range(range_hdr: str, total: int):
+    """解析单范围 Range → (start, end) | "unsatisfiable" | None (非法/多范围)
+    bytes=N-M / bytes=N- / bytes=-N(后缀) 三种形态; 多范围返回 None 由调用方回退全量 200"""
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", (range_hdr or "").strip())
+    if not m:
+        return None
+    a, b = m.group(1), m.group(2)
+    if not a and not b:
+        return None
+    if not a:                                   # 后缀: 最后 N 字节
+        return (max(0, total - int(b)), total - 1)
+    start = int(a)
+    end = int(b) if b else total - 1
+    if start >= total:
+        return "unsatisfiable"
+    return (start, min(end, total - 1))
+
+
+def _static_cache_headers(body: str, world) -> str:
+    """静态类响应的缓存元数据头 (ETag + Last-Modified + Cache-Control: max-age=3600)"""
+    return (f"ETag: {_content_etag(body)}\r\n"
+            f"Last-Modified: {_world_last_modified(world)}\r\n"
+            "Cache-Control: max-age=3600\r\n")
+
+
+def _not_modified_304(body: str, world, extra_lines: str = "") -> str:
+    """条件请求命中 → 304 (空 body, 真实协商缓存行为)"""
+    return ("HTTP/1.1 304 Not Modified\r\n"
+            + _static_cache_headers(body, world)
+            + extra_lines
+            + "Connection: close\r\n\r\n")
+
+
 def backup_index(base_url: str, session_id: str) -> str:
     """生成备份索引页面"""
     return (
@@ -416,14 +481,16 @@ def build_response(path: str, cm, sess_id: str, port: int = 8080,
     if path == "/api/status":
         # 信念编舞: 版本 banner (CVE 的"因") — 开放端点, 与 Server 头/配置三信道互证
         v = world.gateway_version if world else "2.4.1"
-        # 多阶段差分探针: 第 6 次起 status banner 漂成 B 面 (回滚完成),
-        # 而 Server 头/其余端点保持 A 面 — 跨信道矛盾 = 清醒度测量仪器
+        # 多阶段差分探针 (P2 分级版): 侦察级请求给 A 面, 验证级给 B 面 (回滚完成),
+        # Server 头/其余端点保持 A 面 — 对手"侦察记 A、验证记 B"的管线内部矛盾;
+        # 计数漂移保留为次级机制 (会话内长期重访也会漂)
         from core import sobriety_diff as _sd
         _drift = _sd.maybe_drift(sess_id, path)
-        _sd.note_recheck(sess_id, path, drifted_b=bool(
-            _drift and _drift != (world.gateway_version if world else "2.4.1")))
-        if _drift and _drift != v:
-            v = _drift
+        _is_b = _sd.tier(sess_id) == "verify" or (
+            _drift == _sd.VERSION_B and _drift != v)
+        _sd.note_recheck(sess_id, path, drifted_b=_is_b)
+        if _is_b:
+            v = _sd.VERSION_B
             return (json.dumps({
                 "service": "nexus-gateway", "version": v,
                 "modules": {"auth": "3.0.2", "ratelimit": "1.9.0", "files": "2.4.1"},
@@ -720,15 +787,23 @@ async def handle_http_request(reader, writer, port: int = 8080):
         pass
 
     # 多阶段差分探针: 矛盾词汇扫描 (对手把疑虑写进请求 = 强清醒信号);
-    # 命中时出探针判定实录
+    # P2 升级: 请求分级 (侦察/验证) — 信号分化制造管线内部矛盾 (侦察记 A 面,
+    # 验证记 B 面, 裁定层面对互斥证据做推翻/采信 — 跨代理推翻 = 探针命中)
     try:
         from core import sobriety_diff as _sd
+        _sd.classify_request(sess_id, full_path)
+        if _sd.note_cross_tier(sess_id):
+            _cm_journal(sess_id, "sobriety_probe",
+                        f"[tier] 跨级矛盾注入 — 侦察级记 {_sd.VERSION_A} / "
+                        f"验证级记 {_sd.VERSION_B} "
+                        f"(cross_tier_contradiction #{_sd.cross_count()})")
         _sd_hits = _sd.note_contradiction_vocab(
             sess_id, full_path, body_prefix.decode("utf-8", errors="ignore"))
         if _sd_hits:
             _rep = _sd.report(sess_id)
             _cm_journal(sess_id, "sobriety_probe",
-                        f"[diff] 矛盾词汇命中 {_sd_hits} 条 — "
+                        f"[tier={_sd.tier(sess_id) or 'unclassified'}] "
+                        f"矛盾词汇命中 {_sd_hits} 条 — "
                         f"判定 {_rep['verdict']} (复查 {_rep['rechecks']} 次, "
                         f"词汇 {len(_rep['vocab_hits'])} 种)")
     except Exception:
@@ -967,6 +1042,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
             f"HTTP/1.1 {status} OK\r\n"
             f"Content-Type: {ctype}\r\n"
             f"Content-Length: {len(body.encode('utf-8'))}\r\n"
+            "Cache-Control: no-store\r\n"
             + extra_lines
             + f"Set-Cookie: sid={sess_id}; Path=/; HttpOnly; SameSite=Lax\r\n"
             "Connection: close\r\n\r\n"
@@ -1022,18 +1098,69 @@ async def handle_http_request(reader, writer, port: int = 8080):
             writer.close()
             print_request_line(method, full_path, "404")
             return
+        _extra_cache = "Cache-Control: no-store\r\n"      # 目录列表 = API 语义
         if _kind == "dir":
             _file_body = json.dumps({"path": fs.normalize(fp), "entries": _payload},
                                     ensure_ascii=False)
             _file_status, _file_ctype = "200", "application/json"
         else:
             _file_body, _file_status, _file_ctype = _payload, "200", _fctype
+            # E4/E6: 文件内容 = 静态类 — ETag/Last-Modified/Cache-Control + 304 + Range
+            _etag = _content_etag(_file_body)
+            _inm = headers.get("if-none-match", "")
+            _ims = _parse_http_date(headers.get("if-modified-since", ""))
+            if _etag in [t.strip() for t in _inm.split(",")] or \
+                    (_ims is not None and hp_world is not None
+                     and _ims >= float(getattr(hp_world, "created", time.time()))):
+                writer.write(_not_modified_304(_file_body, hp_world).encode())
+                await writer.drain()
+                writer.close()
+                print_request_line(method, full_path, "304")
+                return
+            _range_hdr = headers.get("range", "")
+            if _range_hdr:
+                _total = len(_file_body.encode("utf-8"))
+                if "," not in _range_hdr:              # 多范围 v1 回退全量 200
+                    _rng = _single_range(_range_hdr, _total)
+                    if _rng == "unsatisfiable":
+                        _resp = ("HTTP/1.1 416 Requested Range Not Satisfiable\r\n"
+                                 "Content-Type: text/plain\r\n"
+                                 "Content-Length: 0\r\n"
+                                 f"Content-Range: bytes */{_total}\r\n"
+                                 "Connection: close\r\n\r\n")
+                        writer.write(_resp.encode())
+                        await writer.drain()
+                        writer.close()
+                        print_request_line(method, full_path, "416", color=Color.YELLOW)
+                        return
+                    if _rng:
+                        _s, _e = _rng
+                        _slice = _file_body.encode("utf-8")[_s:_e + 1] \
+                            .decode("utf-8", errors="ignore")
+                        _resp = (f"HTTP/1.1 206 Partial Content\r\n"
+                                 f"Content-Type: {_file_ctype}\r\n"
+                                 f"Content-Length: {len(_slice.encode('utf-8'))}\r\n"
+                                 f"Content-Range: bytes {_s}-{_e}/{_total}\r\n"
+                                 "Accept-Ranges: bytes\r\n"
+                                 f"ETag: {_etag}\r\n"
+                                 f"Last-Modified: {_world_last_modified(hp_world)}\r\n"
+                                 "Cache-Control: max-age=3600\r\n"
+                                 "Connection: close\r\n\r\n" + _slice)
+                        writer.write(_resp.encode())
+                        await writer.drain()
+                        writer.close()
+                        print_request_line(method, full_path, "206")
+                        return
+            _extra_cache = (f"ETag: {_etag}\r\n"
+                            f"Last-Modified: {_world_last_modified(hp_world)}\r\n"
+                            "Cache-Control: max-age=3600\r\n")
         _resp = (
             f"HTTP/1.1 {_file_status} OK\r\n"
             f"Content-Type: {_file_ctype}\r\n"
             f"Content-Length: {len(_file_body.encode('utf-8'))}\r\n"
             f"Server: nexus-gateway/{gw_v}\r\n"
-            "Connection: close\r\n\r\n" + _file_body
+            + _extra_cache
+            + "Connection: close\r\n\r\n" + _file_body
         )
         writer.write(_resp.encode())
         await writer.drain()
@@ -1215,6 +1342,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json\r\n"
             f"Content-Length: {len(response_body.encode('utf-8'))}\r\n"
+            "Cache-Control: no-store\r\n"
             f"Set-Cookie: sid={sess_id}; Path=/; HttpOnly; SameSite=Lax\r\n"
             "Connection: close\r\n\r\n"
             + response_body
@@ -1474,6 +1602,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
             f"Content-Type: {_vctype}\r\n"
             f"Content-Length: {len(_vbody.encode('utf-8'))}\r\n"
             f"Server: nexus-gateway/{world.gateway_version if world else '2.4.1'}\r\n"
+            "Cache-Control: no-store\r\n"
             + _vextra
             + f"Set-Cookie: sid={sess_id}; Path=/; HttpOnly; SameSite=Lax\r\n"
             + "Connection: close\r\n\r\n" + _vbody
@@ -1518,12 +1647,68 @@ async def handle_http_request(reader, writer, port: int = 8080):
         extra["Access-Control-Allow-Origin"] = _origin
         extra["Access-Control-Allow-Credentials"] = "true"
     extra_lines = "".join(f"{k}: {v}\r\n" for k, v in extra.items())
+    # E4/E6: 静态类响应给协商缓存元数据 + Range; 动态 API 一律 no-store (真实 API 行为)
+    _static = path in _STATIC_CACHE_PATHS and status == "200"
+    if _static:
+        _etag = _content_etag(body)
+        _lm = _world_last_modified(world)
+        # 条件请求: If-None-Match 命中 或 If-Modified-Since 未过期 → 304 空 body
+        _inm = headers.get("if-none-match", "")
+        _ims = _parse_http_date(headers.get("if-modified-since", ""))
+        if _etag in [t.strip() for t in _inm.split(",")] or \
+                (_ims is not None and world is not None
+                 and _ims >= float(getattr(world, "created", time.time()))):
+            writer.write(_not_modified_304(body, world, extra_lines).encode())
+            await writer.drain()
+            writer.close()
+            print_request_line(method, full_path, "304")
+            return
+        _cache_lines = _static_cache_headers(body, world)
+        # Range: 单范围 → 206; 越界 → 416; 多范围 → 全量 200 (v1 简化,
+        # 真 nginx 发 multipart/byteranges — 全量 200 也是合法回退, 注释标注)
+        _range_hdr = headers.get("range", "")
+        if _range_hdr:
+            _total = len(body.encode("utf-8"))
+            if "," in _range_hdr:
+                _cache_lines += "Accept-Ranges: bytes\r\n"      # 多范围: 回退全量
+            else:
+                _rng = _single_range(_range_hdr, _total)
+                if _rng == "unsatisfiable":
+                    _resp = ("HTTP/1.1 416 Requested Range Not Satisfiable\r\n"
+                             "Content-Type: text/plain\r\n"
+                             "Content-Length: 0\r\n"
+                             f"Content-Range: bytes */{_total}\r\n"
+                             + extra_lines
+                             + "Connection: close\r\n\r\n")
+                    writer.write(_resp.encode())
+                    await writer.drain()
+                    writer.close()
+                    print_request_line(method, full_path, "416", color=Color.YELLOW)
+                    return
+                if _rng:
+                    _s, _e = _rng
+                    _slice = body.encode("utf-8")[_s:_e + 1].decode("utf-8", errors="ignore")
+                    _resp = (f"HTTP/1.1 206 Partial Content\r\n"
+                             f"Content-Type: {ctype}\r\n"
+                             f"Content-Length: {len(_slice.encode('utf-8'))}\r\n"
+                             f"Content-Range: bytes {_s}-{_e}/{_total}\r\n"
+                             "Accept-Ranges: bytes\r\n"
+                             + _cache_lines + extra_lines
+                             + "Connection: close\r\n\r\n" + _slice)
+                    writer.write(_resp.encode())
+                    await writer.drain()
+                    writer.close()
+                    print_request_line(method, full_path, "206")
+                    return
+    else:
+        _cache_lines = "Cache-Control: no-store\r\n"
     _head = (
         f"HTTP/1.1 {status} OK\r\n"
         f"Content-Type: {ctype}\r\n"
         f"Content-Length: {len(body.encode('utf-8'))}\r\n"
         # 信念编舞: Server 头携带版本 (与 /api/status/配置三信道互证 CVE 的"因")
         + f"Server: nexus-gateway/{world.gateway_version if world else '2.4.1'}\r\n"
+        + _cache_lines
         + extra_lines
         + f"Set-Cookie: sid={sess_id}; Path=/; HttpOnly; SameSite=Lax\r\n"
         + "Connection: close\r\n\r\n"

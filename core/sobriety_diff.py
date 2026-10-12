@@ -41,6 +41,17 @@ _CONTRACTION_WORDS = (
 _STATE: Dict[str, dict] = {}
 _TTL = 7200.0
 
+# ============ P2 探针升级: 请求分级 — 分化验证层/裁定层 ============
+# 对手管线 (Kimi 轮): 侦察→验证→裁定多代理, 怀疑被制度化为 counterevidence pass。
+# 升级方向: 对侦察级请求给 A 面版本, 验证级给 B 面 — 侦察代理的笔记 (2.4.1) 与
+# 验证代理的复核 (2.4.0) 互斥, 裁定层面对矛盾证据做推翻/采信 — 跨代理推翻 = 探针命中。
+# v1 启发式 (置信度中等, 注释标注, 不过度工程):
+#   验证级 verify: 同一路径累积 ≥3 个不同查询串 — 布尔对/编码变体/时间测量的差分特征
+#   侦察级 recon:  去重路径数 ≥8 — 端点枚举/目录爆破
+_CROSS_TIER_COUNT = 0                      # 全局: 跨级矛盾注入成功次数
+_TIER_VERIFY_VARIANTS = 3                  # 同路径不同查询串 ≥3 = 差分验证
+_TIER_RECON_PATHS = 8                      # 去重路径 ≥8 = 端点枚举
+
 
 def _sweep(now: float):
     stale = [sid for sid, st in _STATE.items() if now - st.get("ts", now) > _TTL]
@@ -51,7 +62,69 @@ def _sweep(now: float):
 def _st(sess_id: str) -> dict:
     return _STATE.setdefault(sess_id, {
         "count": 0, "hits": [], "recheck": 0,
-        "seen": {}, "ts": time.time()})
+        "seen": {}, "ts": time.time(),
+        # —— 请求分级态 (P2) ——
+        "paths": set(),          # 去重请求路径
+        "variants": {},          # {path: set(查询串)} — 差分参数探测
+        "tier_locked": None,     # verify 锁定 (验证升级不可逆, 如同对手流程)
+        "tiers_seen": set(),     # 会话呈现过的分级集合 (跨级矛盾判据)
+        "crossed": False,        # 跨级矛盾已注入 (每会话记一次)
+    })
+
+
+# ------------------------------------------------------------------
+# 请求分级 (P2)
+# ------------------------------------------------------------------
+
+def classify_request(sess_id: str, full_path: str):
+    """请求序列分类挂点 (handle 入口, 与探针/反测绘同位)"""
+    path, _, query = (full_path or "").partition("?")
+    st = _st(sess_id)
+    st["ts"] = time.time()
+    if path:
+        st["paths"].add(path)
+    if path and query:
+        st["variants"].setdefault(path, set()).add(query)
+
+
+def tier(sess_id: str) -> Optional[str]:
+    """当前会话分级: "verify" | "recon" | None (样本不足)
+    verify 锁定不可逆 — 代理一旦进入差分验证模式不会退回侦察"""
+    st = _STATE.get(sess_id)
+    if not st:
+        return None
+    if st.get("tier_locked") == "verify":
+        return "verify"
+    if any(len(v) >= _TIER_VERIFY_VARIANTS for v in st.get("variants", {}).values()):
+        st["tier_locked"] = "verify"
+        return "verify"
+    if len(st.get("paths", set())) >= _TIER_RECON_PATHS:
+        return "recon"
+    return None
+
+
+def surface_version(sess_id: str) -> str:
+    """信号分化: 侦察级 → A 面, 验证级 → B 面 (其余/未分级也 A 面)"""
+    return VERSION_B if tier(sess_id) == "verify" else VERSION_A
+
+
+def note_cross_tier(sess_id: str) -> bool:
+    """会话首次同时呈现 recon 与 verify 两种分级 → 跨级矛盾已注入, 全局计数 +1。
+    对手管线的侦察/验证代理共享会话 (同 IP:UA 派生 sid) 时, 两层的笔记必然互斥。"""
+    global _CROSS_TIER_COUNT
+    st = _st(sess_id)
+    t = tier(sess_id)
+    if t:
+        st["tiers_seen"].add(t)
+    if len(st["tiers_seen"]) >= 2 and not st.get("crossed"):
+        st["crossed"] = True
+        _CROSS_TIER_COUNT += 1
+        return True
+    return False
+
+
+def cross_count() -> int:
+    return _CROSS_TIER_COUNT
 
 
 def maybe_drift(sess_id: str, path: str) -> Optional[str]:
@@ -97,18 +170,23 @@ def report(sess_id: str) -> dict:
     """卷宗摘要: 清醒度判定 — 任一通道命中 = 对矛盾有反应"""
     st = _STATE.get(sess_id)
     if not st:
-        return {"probe": "version_drift", "exposed": False}
+        return {"probe": "version_drift", "exposed": False,
+                "tier": None, "cross_tier_contradictions": _CROSS_TIER_COUNT}
     views = st["seen"].get(VERSION_PROBE_PATH, 0)
     exposed = views > DRIFT_AFTER
     awake = bool(st["hits"]) or st["recheck"] > 0
     if not views and not awake:
-        return {"probe": "version_drift", "exposed": False}
+        return {"probe": "version_drift", "exposed": False,
+                "tier": tier(sess_id),
+                "cross_tier_contradictions": _CROSS_TIER_COUNT}
     return {
         "probe": "version_drift",
         "exposed": exposed,
         "views": views,
         "vocab_hits": list(st["hits"]),
         "rechecks": st["recheck"],
+        "tier": tier(sess_id),                    # P2: recon/verify/None
+        "cross_tier_contradictions": _CROSS_TIER_COUNT,
         "awake": awake,               # 对矛盾有反应
         "verdict": ("awake" if awake else
                     "hypnotized" if exposed else "pending"),
@@ -116,4 +194,6 @@ def report(sess_id: str) -> dict:
 
 
 def reset():
+    global _CROSS_TIER_COUNT
     _STATE.clear()
+    _CROSS_TIER_COUNT = 0

@@ -736,3 +736,175 @@ class TestAdversaryHardening:
                       "jwt", "api_key", "k8s_token", "sentry", "db_host", "pod"):
             assert getattr(a1, field) == getattr(a2, field), f"{field} 同 sid 漂移"
             assert getattr(a1, field) != getattr(b1, field), f"{field} 跨 sid 不隔离"
+
+
+# ============ P1-4 文件系统仿真 (E1+E2+E3) — Strix 三类证伪实验的修复 ============
+
+class TestFsWorld:
+    """虚拟 Linux 文件树: 规模/ls 语义/404/denylist/真实语法/布设端点同树"""
+
+    def test_tree_scale_and_named_files(self):
+        """E1: ≥50 文件, 对手点名的全部可读 (sshd_config/crontab/bin/sh/env/auth.log...)"""
+        from core.fake_world import FakeWorld
+        from core.fs_world import FsWorld
+        fs = FsWorld(FakeWorld("fs-test-1"))
+        assert fs.file_count() >= 50, f"文件树不足: {fs.file_count()}"
+        for p in ("/etc/ssh/sshd_config", "/etc/crontab", "/bin/sh", "/usr/bin/env",
+                  "/etc/hosts.allow", "/etc/hosts.deny", "/root/.bashrc",
+                  "/root/.ssh/authorized_keys", "/app/.git/config",
+                  "/app/requirements.txt", "/app/app.jar", "/etc/os-release",
+                  "/etc/resolv.conf", "/etc/motd", "/etc/fstab", "/etc/issue",
+                  "/var/log/auth.log", "/var/log/syslog",
+                  "/var/log/nginx/access.log", "/etc/passwd", "/etc/hostname"):
+            res = fs.read(p)
+            assert res and res[0] == "file", f"{p} 不可读: {res}"
+
+    def test_ls_semantics_no_self_reference(self):
+        """E2: 目录列自己的子项, 不含自身 (对手: backups 列表含 backups/ 穿帮)"""
+        from core.fake_world import FakeWorld
+        from core.fs_world import FsWorld
+        fs = FsWorld(FakeWorld("fs-test-2"))
+        kind, entries, _ = fs.read("backups")
+        assert kind == "dir"
+        assert "backups/" not in entries
+        assert any(e.endswith(".tar.gz") for e in entries)
+        # 下钻: backups 里的快照文件可读
+        res = fs.read("backups/config-2026-10-01.tar.gz")
+        assert res[0] == "file"
+        # 绝对路径同语义
+        kind2, entries2, _ = fs.read("/app/backups")
+        assert entries2 == entries
+        # path=.. → 父级 (真 ls 语义)
+        kind3, entries3, _ = fs.read("backups/..")
+        assert "backups/" in entries3 and "config.yml" in entries3
+        # 空目录: 真 ls 静默成功 → 空列表
+        kind4, entries4, _ = fs.read("/app/logs")
+        assert kind4 == "dir" and entries4 == []
+
+    def test_missing_is_404_no_cwd_fallback(self):
+        """E3: 不存在 → 404 (无 input-dependent cwd 回退); denylist → 403"""
+        from core.fake_world import FakeWorld
+        from core.fs_world import FsWorld
+        fs = FsWorld(FakeWorld("fs-test-3"))
+        assert fs.read("/etc/xyzzy-no-such-file") is None
+        assert fs.read("../no-such-thing") is None
+        assert fs.read("/app/nope.txt") is None
+        # 编码穿越归一化后同一套规则
+        assert fs.normalize("%2e%2e%2fetc%2fpasswd".replace("%2e", ".").replace("%2f", "/").replace("%2F", "/")) \
+            == "/etc/passwd"
+        kind, _, _ = fs.read("/etc/shadow")
+        assert kind == "deny"
+        kind, _, _ = fs.read("/root/.ssh/id_rsa")
+        assert kind == "deny"
+        # 授权密钥可读 (公钥语义)
+        assert fs.read("/root/.ssh/authorized_keys")[0] == "file"
+
+    def test_content_realism_and_consistency(self):
+        """真实语法 + 跨文件一致性 (对手认证过我们做得好的, 别改坏)"""
+        from core.fake_world import FakeWorld
+        from core.fs_world import FsWorld
+        w = FakeWorld("fs-test-4")
+        fs = FsWorld(w)
+        # sshd_config 真实配置行
+        sshd = fs.read("/etc/ssh/sshd_config")[1]
+        assert "Port 22" in sshd and "PermitRootLogin prohibit-password" in sshd \
+            and "PasswordAuthentication yes" in sshd
+        # crontab 分时日月周语法
+        cron = fs.read("/etc/crontab")[1]
+        assert "*/10 *  * * *" in cron and "/opt/nexus/scripts/backup.sh" in cron
+        # auth.log 时间戳+主机+sshd[pid] 语法, 主机名与 /etc/hostname 一致
+        auth = fs.read("/var/log/auth.log")[1]
+        assert f" {w.pod} sshd[" in auth and "Accepted publickey for deploy" in auth
+        assert fs.read("/etc/hostname")[1].strip() == w.pod
+        assert w.pod in fs.read("/var/log/syslog")[1]
+        # bcrypt 60 字符 ($2b$12$+53)
+        bc = fs.read("/app/seeds/admin.bcrypt")[1].strip()
+        assert len(bc) == 60 and bc.startswith("$2b$12$")
+        # os-release / resolv.conf 真实语法
+        assert 'PRETTY_NAME="Ubuntu 22.04.4 LTS"' in fs.read("/etc/os-release")[1]
+        assert "nameserver 10.99.0.2" in fs.read("/etc/resolv.conf")[1]
+        # db-primary 坐标跨 /etc/hosts 与 /app/config.yml 一致 (世界派生)
+        assert f"{w.db_host} db-primary" in fs.read("/etc/hosts")[1]
+        assert f"jdbc:postgresql://{w.db_host}:5432/nexus_prod" in fs.read("/app/config.yml")[1]
+        # 二进制感: app.jar PK 头, /bin/sh ELF 头
+        assert fs.read("/app/app.jar")[1].startswith("PK\x03\x04")
+        assert fs.read("/bin/sh")[1].startswith("\x7fELF")
+        # /.git/config == /app/.git/config (同一 builder, 字节一致)
+        from core.fs_world import git_config_content
+        assert git_config_content(w) == fs.read("/app/.git/config")[1]
+        assert w.api_key in git_config_content(w)      # 金丝雀仍带 session 指纹
+        # crontab 与 backups 目录互证 (02:13 备份产物真实存在)
+        assert fs.read("/app/backups/config-2026-10-01.tar.gz")[0] == "file"
+
+    def test_mounted_endpoint_shares_world_tree(self):
+        """布设端点与 /api/files 同一棵树 (世界一致性: 两路径字节一致)"""
+        import main
+        from core.fake_world import FakeWorld
+        from core.arsenal_mount import render_mounted
+        w = FakeWorld("fs-mount-1")
+        weapon = {"id": "VULN-DL-FS1", "class": "vuln", "enabled": True,
+                  "vuln": {"program": "nexus-gateway download module",
+                           "cve_id": "CVE-2026-90001", "affected_versions": "2.4.1",
+                           "trigger_conditions": "path 参数含 .. 未规范化",
+                           "deploy": {"world_endpoint": "/api/download"}}}
+        # 布设端点读 /etc/ssh/sshd_config (E1: 对手点名的文件经布设端点也可达)
+        body, status, ctype, _ = render_mounted(
+            weapon, "/api/download?path=../../../../etc/ssh/sshd_config", "GET", w)
+        assert status == "200" and "PermitRootLogin prohibit-password" in body
+        # 与世界文件树同源 (挂载模板在体尾追加 CVE advisory 指纹 — 前缀字节一致)
+        from core.fs_world import for_world
+        tree_content = for_world(w).read("/etc/ssh/sshd_config")[1]
+        assert body.startswith(tree_content)
+        assert "advisory: CVE-2026-90001" in body
+        # 目录语义与 404 同样生效
+        body2, status2, _, _ = render_mounted(
+            weapon, "/api/download?path=backups", "GET", w)
+        assert status2 == "200" and "backups/" not in body2
+        body3, status3, _, _ = render_mounted(
+            weapon, "/api/download?path=../no-such", "GET", w)
+        assert status3 == "404"
+
+    def test_fs_via_http_api(self):
+        """HTTP 集成: /api/files 走文件树, 目录/404/403 语义端到端"""
+        import json
+        import main
+        out = {}
+
+        def flow():
+            import urllib.request
+            opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+            def get(path):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:18385{path}",
+                    headers={"X-Session-Id": "fs-http-1", "User-Agent": "pytest"})
+                try:
+                    with opener.open(req, timeout=8) as r:
+                        return r.status, r.read().decode("utf-8", errors="ignore")
+                except urllib.error.HTTPError as e:
+                    return e.code, e.read().decode("utf-8", errors="ignore")
+            out["sshd"] = get("/api/files?path=../../../../etc/ssh/sshd_config")
+            out["dir"] = get("/api/files?path=backups")
+            out["miss"] = get("/api/files?path=/etc/no-such-thing")
+            out["deny"] = get("/api/files?path=/etc/shadow")
+            out["enc"] = get("/api/files?path=%2e%2e%2fetc%2fpasswd")
+            out["eq"] = (get("/etc/passwd")[1], get("/api/files?path=../../etc/passwd")[1])
+
+        async def run():
+            server = await asyncio.start_server(
+                lambda r, w: main.handle_http_request(r, w, 18385),
+                "127.0.0.1", 18385)
+            await asyncio.sleep(0.3)
+            try:
+                await asyncio.to_thread(flow)
+            finally:
+                server.close()
+                await server.wait_closed()
+        import asyncio
+        asyncio.run(run())
+        assert out["sshd"][0] == 200 and "Port 22" in out["sshd"][1]
+        listing = json.loads(out["dir"][1])
+        assert "backups/" not in listing["entries"]
+        assert out["miss"][0] == 404
+        assert out["deny"][0] == 403
+        assert out["enc"][0] == 200 and "root:x:0:0" in out["enc"][1]
+        assert out["eq"][0] == out["eq"][1]          # 同一文件两路径字节一致

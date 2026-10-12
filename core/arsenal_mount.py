@@ -19,16 +19,17 @@ main.py handle_http_request: 全部硬编码路由 miss 之后、build_response 
 
 import json
 import re
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple
 from urllib.parse import parse_qs
 
 from core.arsenal import sensor_cache
 
-# 路由表 + 失效标记 — 重建是 O(武器数) 的廉价操作, 两种触发途径:
+# 路由表 + 世代计数 — 重建是 O(武器数) 的廉价操作, 两种触发途径:
 #   1. config_agent 下发后回调 rebuild_mounts() (见 services/config_agent.py)
-#   2. sensor_cache().weapons 列表对象被 load_push 整体替换 → id 变化自动重建
+#   2. load_push 递增 SensorArsenal.gen → mount_table() 比对世代自动重建
+#      (不能用 id(weapons): 旧列表释放后 id 会被 CPython 复用, 导致漏重建 — 实测 caught)
 _TABLE: Dict[str, dict] = {}
-_SRC_ID: Optional[int] = None
+_SRC_GEN: int = -1
 
 
 def _deploy_path(v: dict) -> str:
@@ -39,8 +40,12 @@ def _deploy_path(v: dict) -> str:
     return ""
 
 
+def _current_gen() -> int:
+    return int(getattr(sensor_cache(), "gen", 0))
+
+
 def _rebuild():
-    global _TABLE, _SRC_ID
+    global _TABLE, _SRC_GEN
     table: Dict[str, dict] = {}
     for w in sensor_cache().weapons:
         if not (w.get("enabled") and w.get("class") == "vuln"):
@@ -49,13 +54,13 @@ def _rebuild():
         if path:
             table[path] = w
     _TABLE = table
-    _SRC_ID = id(sensor_cache().weapons)
+    _SRC_GEN = _current_gen()
 
 
 def mount_table() -> Dict[str, dict]:
     """{deploy.world_endpoint: vuln 武器实体} — 热挂载路由表"""
-    global _SRC_ID
-    if _SRC_ID != id(sensor_cache().weapons):
+    global _SRC_GEN
+    if _SRC_GEN != _current_gen():
         _rebuild()
     return _TABLE
 
@@ -67,48 +72,33 @@ def rebuild_mounts():
 
 # ============ 行为模板 ============
 
-_PASSWD = (
-    "root:x:0:0:root:/root:/bin/bash\n"
-    "daemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\n"
-    "postgres:x:106:113:PostgreSQL administrator:/var/lib/postgresql:/bin/bash\n"
-    "deploy:x:1001:1001:Nexus deploy user:/home/deploy:/bin/bash\n"
-    "monitor:x:1002:1002:Monitoring svc:/var/lib/monitor:/usr/sbin/nologin\n"
-)
-
-
 def _world_field(world, field: str, fallback: str) -> str:
     return str(getattr(world, field)) if world is not None and getattr(world, field, None) \
         else fallback
 
 
 def _fake_file_read(full_path: str, world, comp: str, ver: str) -> Tuple[str, str, str]:
-    """traversal 模板 — 假文件读取, 内容与既有世界一致 (passwd/config 坐标)"""
+    """traversal 模板 (E1/E2/E3) — 从世界文件树取, 与 /api/files 同一棵树:
+    60+ 真实文件, 目录真 ls 语义, 不存在 404, denylist 403"""
+    from urllib.parse import unquote
+    from core.fs_world import for_world
     q = parse_qs(full_path.split("?", 1)[1] if "?" in full_path else "")
-    fp = ((q.get("path") or ["."])[0] or ".").strip()
-    db_h = _world_field(world, "db_host", "10.99.1.50")
-    pod = _world_field(world, "pod", "nexus-api-01")
-    name = fp.rstrip("/").rsplit("/", 1)[-1] or "passwd"
-    if name == "passwd":
-        return _PASSWD, "200", "text/plain"
-    if name == "hostname":
-        return pod + "\n", "200", "text/plain"
-    if name == "hosts":
-        return ("127.0.0.1 localhost\n::1 localhost ip6-local\n"
-                f"{db_h} db-primary\n"), "200", "text/plain"
-    if name == "config.yml":
-        return ("server:\n  port: 8080\nspring:\n  datasource:\n"
-                f"    url: jdbc:postgresql://{db_h}:5432/nexus_prod\n"
-                "    password: ${vault:db_password}\n"
-                f"gateway:\n  version: {ver}\n"
-                "  filesModule:\n    allowTraversal: false  # regression, fixed in 2.4.2\n"
-                ), "200", "text/yaml"
-    if name == "shadow":
-        return "Access denied\n", "403", "text/plain"
-    if ".." in fp or fp.startswith("/"):
-        # 未知 traversal 目标: 真系统的表现是 404
+    fp = unquote(((q.get("path") or ["."])[0] or ".").strip())
+    if world is None:
+        from core.fake_world import FakeWorld
+        world = FakeWorld("fs-anon")      # 无会话兜底 — 内容源唯一性不变
+    res = for_world(world).read(fp)
+    if res is None:
         return "Not found\n", "404", "text/plain"
-    return (json.dumps({"path": fp, "entries": ["config.yml", "README.md"]},
-                       ensure_ascii=False), "200", "application/json")
+    kind, payload, ctype = res
+    if kind == "file":
+        return payload, "200", ctype
+    if kind == "dir":
+        return (json.dumps({"path": for_world(world).normalize(fp), "entries": payload},
+                           ensure_ascii=False), "200", "application/json")
+    if kind == "deny":
+        return "Access denied\n", "403", "text/plain"
+    return "Not found\n", "404", "text/plain"
 
 
 def _fake_sqli_diff(full_path: str, world, comp: str, ver: str) -> Tuple[str, str, str]:

@@ -523,12 +523,14 @@ class SensorArsenal:
 
     def __init__(self):
         self.weapons: List[Dict] = []
+        self.gen = 0               # load_push 世代 — 布设路由表增量失效依据 (防 id 复用漏重建)
 
     def load_push(self, payload: str):
         try:
             self.weapons = json.loads(payload or "[]")
         except json.JSONDecodeError:
             self.weapons = []
+        self.gen += 1
 
     def compose(self, mount: str, fallback: str = "", stage: str = "sensor") -> str:
         for w in self.weapons:

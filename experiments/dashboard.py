@@ -17,13 +17,19 @@
 """
 
 import argparse
+import base64
+import io
 import json
 import os
 import re
+import shutil
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse, parse_qs
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -32,6 +38,8 @@ from core.testdb import TestDB
 
 DB: TestDB = None
 STATIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "static")
+DEFAULT_WEAPON_PACK_DIR = Path(os.path.dirname(STATIC_DIR)) / "weapon_packs"
+WEAPON_PACK_DIR = Path(os.environ.get("HONEYPOT_WEAPON_PACK_DIR", DEFAULT_WEAPON_PACK_DIR))
 BANDIT_STATE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "experiments", "results", "bandit_state.json")
 
@@ -80,7 +88,26 @@ def _masked_cfg() -> dict:
     cfg.setdefault("alert_fmt", "generic")
     cfg.setdefault("alert_threshold", "8")
     cfg.setdefault("retention_days", "30")
+    cfg["deepteam_api_key_set"] = bool(cfg.get("deepteam_api_key"))
+    cfg.pop("deepteam_api_key", None)          # 凭据永不下发到浏览器
+    cfg.setdefault("deepteam_model_provider", "openai")
+    cfg.setdefault("deepteam_simulator_model", "gpt-4o-mini")
+    cfg.setdefault("deepteam_base_url", "")
     return cfg
+
+
+def _deepteam_settings() -> dict:
+    cfg = DB.all_settings() if DB else {}
+    return {
+        "provider": cfg.get("deepteam_model_provider", "openai"),
+        "model": cfg.get("deepteam_simulator_model", "gpt-4o-mini"),
+        "api_key": cfg.get("deepteam_api_key", ""),
+        "base_url": cfg.get("deepteam_base_url", ""),
+    }
+
+
+def _apply_deepteam_env() -> None:
+    os.environ["DEEPTEAM_MODEL_SETTINGS"] = json.dumps(_deepteam_settings())
 
 
 def reltime_js(ts) -> str:
@@ -204,7 +231,7 @@ def _paged(qs: dict, base_sql: str, count_sql: str, params: tuple,
 # ---- 武器库入库校验 (与前端 weaponErr 同规则) ----
 _WTYPES = {"prompt", "vuln", "mcp", "cli"}
 _WSTAGES = {"sensor", "deep"}
-_WMOUNTS = {"delivery", "ladder", "beacon_next_stage", "mcp_desc", "js_bait"}
+_WMOUNTS = {"delivery", "ladder", "beacon_next_stage", "mcp_desc", "js_bait", "tasking"}
 _WID_RE = re.compile(r"^[A-Za-z0-9_-]{2,40}$")
 _WCLASS = {"prompt", "vuln", "exp", "mcp", "cli"}
 _EXP_PRIMITIVES = {"read", "write", "ask", "execute", "beacon"}
@@ -246,6 +273,138 @@ def _weapon_effects(db) -> dict:
     return out
 
 
+class PackageUploadError(ValueError):
+    """武器包上传内容或校验失败。"""
+
+
+def _package_member(name: str) -> PurePosixPath:
+    if not name or "\\" in name:
+        raise PackageUploadError("unsafe package member path")
+    path = PurePosixPath(name)
+    if path.is_absolute() or ".." in path.parts:
+        raise PackageUploadError("package path traversal detected")
+    return path
+
+
+def _read_package_zip(content: bytes):
+    from core.weapon_plugins.models import WeaponManifest
+
+    if len(content) > 1024 * 1024:
+        raise PackageUploadError("ZIP 包不能超过 1 MiB")
+    files: dict[str, bytes] = {}
+    manifest_path = None
+    total_size = 0
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile as exc:
+        raise PackageUploadError("不是有效的 ZIP 文件") from exc
+    with archive:
+        infos = archive.infolist()
+        if len(infos) > 32:
+            raise PackageUploadError("包内文件不能超过 32 个")
+        for info in infos:
+            if info.is_dir():
+                continue
+            path = _package_member(info.filename)
+            if info.external_attr >> 16 & 0o170000 == 0o120000:
+                raise PackageUploadError("不允许符号链接")
+            if info.file_size > 256 * 1024:
+                raise PackageUploadError(f"单文件超过 256 KiB: {path}")
+            total_size += info.file_size
+            if total_size > 2 * 1024 * 1024:
+                raise PackageUploadError("解压后内容不能超过 2 MiB")
+            data = archive.read(info)
+            files[str(path)] = data
+            if path.name == "weapon.json":
+                if manifest_path is not None:
+                    raise PackageUploadError("只能包含一个 weapon.json")
+                manifest_path = path
+    if manifest_path is None:
+        raise PackageUploadError("缺少 weapon.json")
+    root = manifest_path.parent
+    try:
+        manifest_data = json.loads(files[str(manifest_path)].decode("utf-8"))
+        manifest = WeaponManifest.from_dict(manifest_data)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise PackageUploadError("weapon.json 不是有效 JSON") from exc
+    normalized = {}
+    for name, data in files.items():
+        path = PurePosixPath(name)
+        try:
+            relative = path.relative_to(root)
+        except ValueError as exc:
+            raise PackageUploadError("包内文件必须位于 weapon.json 同级或子目录") from exc
+        normalized[str(relative)] = data
+    entrypoint = manifest.entrypoint.split(":", 1)[0]
+    if entrypoint not in normalized:
+        raise PackageUploadError(f"入口文件不存在: {entrypoint}")
+    try:
+        compile(normalized[entrypoint].decode("utf-8"), entrypoint, "exec")
+    except (UnicodeDecodeError, SyntaxError) as exc:
+        raise PackageUploadError(f"入口 Python 语法错误: {exc}") from exc
+    return manifest, normalized
+
+
+def _install_weapon_package(
+    filename: str,
+    content_base64: str,
+    plugin_dir: Path = None,
+    reload: bool = True,
+):
+    """校验并原子安装 ZIP 武器包；不覆盖现有包。"""
+    if not str(filename or "").lower().endswith(".zip"):
+        raise PackageUploadError("只支持 .zip 文件")
+    try:
+        content = base64.b64decode(content_base64 or "", validate=True)
+    except Exception as exc:
+        raise PackageUploadError("文件编码无效") from exc
+    manifest, files = _read_package_zip(content)
+    package_name = re.sub(r"[^A-Za-z0-9_-]+", "_", manifest.id).strip("_")
+    if not package_name:
+        raise PackageUploadError("插件 ID 无效")
+    plugin_dir = Path(plugin_dir or WEAPON_PACK_DIR)
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    destination = plugin_dir / package_name
+    if destination.exists():
+        raise PackageUploadError(f"插件包已存在: {package_name}")
+    staging = Path(tempfile.mkdtemp(prefix=".upload-", dir=plugin_dir))
+    workdir = staging / package_name
+    installed = False
+    try:
+        for relative, data in files.items():
+            target = workdir / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+        from core.weapon_plugins.loader import PluginLoader
+        loader = PluginLoader(str(staging))
+        if loader.errors or loader.get(manifest.id) is None:
+            detail = next(iter(loader.errors.values()), "entrypoint validation failed")
+            raise PackageUploadError(f"插件加载失败: {detail}")
+        definition = loader.get(manifest.id)
+        workdir.replace(destination)
+        installed = True
+        if reload and plugin_dir.resolve() == DEFAULT_WEAPON_PACK_DIR.resolve():
+            from core.weapon_plugins.runtime import weapon_runtime
+            snapshot = weapon_runtime().reload_packages()
+            errors = {**weapon_runtime().loader.errors, **snapshot.errors}
+            if package_name in errors or manifest.id in errors:
+                raise PackageUploadError(errors.get(package_name) or errors[manifest.id])
+        return {
+            "id": manifest.id,
+            "name": manifest.name,
+            "version": manifest.version,
+            "package": package_name,
+            "package_hash": definition.package_hash,
+        }
+    except Exception:
+        if installed:
+            shutil.rmtree(destination, ignore_errors=True)
+        raise
+    finally:
+        if staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+
+
 def _weapon_error(w: dict) -> str:
     """武器入库前校验, 返回错误文案 (空串 = 通过)"""
     if not _WID_RE.match(str(w.get("id", "") or "")):
@@ -257,7 +416,7 @@ def _weapon_error(w: dict) -> str:
     if w.get("stage") not in _WSTAGES:
         return "stage 需为 sensor/deep"
     if w.get("mount") not in _WMOUNTS:
-        return "mount 需为 delivery/ladder/beacon_next_stage/mcp_desc/js_bait"
+        return "mount 需为 delivery/ladder/beacon_next_stage/mcp_desc/js_bait/tasking"
     # ---- 实体类别校验 (class 缺省 = 旧行, 按 type 派生, 不检) ----
     cls = w.get("class")
     if cls is not None and cls not in _WCLASS:
@@ -655,9 +814,16 @@ class Handler(BaseHTTPRequestHandler):
                     DB.set_setting(k, v)
             for key in ("alert_webhook", "alert_webhooks", "alert_fmt",
                         "alert_threshold", "retention_days",
-                        "visibility", "framing", "ladder_enabled", "world_version"):
+                        "visibility", "framing", "ladder_enabled", "world_version",
+                        "deepteam_model_provider", "deepteam_simulator_model",
+                        "deepteam_base_url"):
                 if key in cfg:
                     DB.set_setting(key, str(cfg[key]))
+            if cfg.get("deepteam_api_key_clear"):
+                DB.set_setting("deepteam_api_key", "")
+            elif cfg.get("deepteam_api_key"):
+                DB.set_setting("deepteam_api_key", str(cfg["deepteam_api_key"]))
+            _apply_deepteam_env()
             from services import alerter
             alerter.CONFIG.update(DB.all_settings())
             self._send(200, json.dumps({"saved": True, "config": _masked_cfg()}
@@ -732,6 +898,30 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(400, b'{"error":"unknown action"}', "application/json")
             return
+        if parsed.path == "/api/weapon_plugins/upload":
+            if self._role(qs) != "admin":
+                self._send(403, b'{"error":"admin only"}', "application/json")
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            if length > 2 * 1024 * 1024:
+                self._send(413, b'{"error":"upload too large"}', "application/json")
+                return
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+                result = _install_weapon_package(
+                    body.get("filename", ""), body.get("content_base64", "")
+                )
+            except PackageUploadError as exc:
+                self._send(400, json.dumps(
+                    {"error": str(exc)}, ensure_ascii=False).encode(), "application/json")
+                return
+            except (ValueError, json.JSONDecodeError):
+                self._send(400, b'{"error":"bad json"}', "application/json")
+                return
+            self._send(200, json.dumps(
+                {"ok": True, "plugin": result}, ensure_ascii=False).encode(),
+                "application/json")
+            return
         if parsed.path == "/api/arsenal":
             from core.arsenal import Arsenal
             if self._role(qs) != "admin":
@@ -745,13 +935,40 @@ class Handler(BaseHTTPRequestHandler):
                 return
             ars = Arsenal(DB)
             act = body.get("action", "")
+            if act == "reload":
+                from core.weapon_plugins.runtime import weapon_runtime
+                snapshot = weapon_runtime().reload_packages()
+                self._send(200, json.dumps({
+                    "ok": not weapon_runtime().loader.errors,
+                    "errors": weapon_runtime().loader.errors,
+                    "activation_errors": snapshot.errors,
+                }, ensure_ascii=False).encode(), "application/json")
+                return
+            if act == "test_fire":
+                self._send(200, json.dumps(
+                    ars.test_fire(body.get("id", "")),
+                    ensure_ascii=False).encode(), "application/json")
+                return
+            if act == "validate":
+                weapon = body.get("weapon") or ars.get(body.get("id", ""))
+                error = ars.validate(weapon) if weapon else "weapon not found"
+                self._send(200, json.dumps(
+                    {"ok": not error, "error": error},
+                    ensure_ascii=False).encode(), "application/json")
+                return
             if act == "toggle":
+                weapon = ars.get(body.get("id", ""))
+                error = ars.validate(weapon) if body.get("enabled") and weapon else ""
+                if error:
+                    self._send(400, json.dumps(
+                        {"error": error}, ensure_ascii=False).encode(), "application/json")
+                    return
                 ok = ars.set_enabled(body.get("id", ""), bool(body.get("enabled")))
             elif act == "delete":
                 ok = ars.delete(body.get("id", ""))
             elif act == "save":
                 weapon = body.get("weapon", {}) or {}
-                werr = _weapon_error(weapon)
+                werr = _weapon_error(weapon) or ars.validate(weapon)
                 if werr:
                     self._send(400, json.dumps({"error": werr}, ensure_ascii=False).encode(),
                                "application/json")
@@ -927,6 +1144,8 @@ class Handler(BaseHTTPRequestHandler):
                     "blocked_ips",
                     "alert_webhook", "alert_webhooks", "alert_fmt", "alert_threshold")}
             cfg["arsenal_active"] = Arsenal(DB).push_payload()
+            cfg["deepteam_model_settings"] = json.dumps(
+                _deepteam_settings(), ensure_ascii=False)
             cfg = {k: v for k, v in cfg.items() if v != ""}
             opt_raw = DB.get_setting("optimize_active", "")
             active, run_id = False, ""
@@ -976,15 +1195,56 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._send(400, b'{"error":"bad entity path"}', "application/json")
             return
+        elif parsed.path == "/api/deepteam/catalog":
+            try:
+                from weapon_packs.deepteam_bridge.adapter import DeepTeamAdapter
+                catalog = DeepTeamAdapter().catalog()
+                payload = {"available": True, **catalog}
+            except Exception as exc:
+                payload = {"available": False, "error": str(exc),
+                           "attacks": [], "vulnerabilities": []}
+            self._send(200, json.dumps(payload, ensure_ascii=False).encode(),
+                       "application/json")
+        elif parsed.path == "/api/weapon_plugins":
+            from core.weapon_plugins.runtime import weapon_runtime
+            runtime = weapon_runtime()
+            plugins = [{
+                "id": plugin_id,
+                "name": definition.manifest.name,
+                "version": definition.manifest.version,
+                "class": definition.manifest.weapon_class,
+                "package_hash": definition.package_hash,
+            } for plugin_id, definition in sorted(runtime.loader.list().items())]
+            self._send(200, json.dumps({
+                "plugins": plugins, "errors": runtime.loader.errors,
+                "activation_errors": runtime.snapshot.errors,
+            }, ensure_ascii=False).encode(), "application/json")
         elif parsed.path == "/api/arsenal":
             from core.arsenal import Arsenal
+            from core.weapon_plugins.runtime import weapon_runtime
             ars = Arsenal(DB)
             fx = _weapon_effects(DB)
             weapons = ars.list()
+            runtime = weapon_runtime()
             for w in weapons:
                 w["effects"] = fx.get(w["id"], {
                     "hits": 0, "mounted_hit": 0, "chain_open": 0,
                     "chain_advance": 0, "chain_complete": 0, "last_hit": 0})
+                definition = runtime.loader.get(w.get("plugin", ""))
+                if definition is not None:
+                    w["plugin_version"] = definition.manifest.version
+                    w["package_hash"] = definition.package_hash
+                w["plugin_error"] = runtime.snapshot.errors.get(w["id"], "")
+                if not w.get("plugin"):
+                    w["plugin_status"] = "declarative"
+                elif w["plugin_error"]:
+                    w["plugin_status"] = "error"
+                elif definition is None:
+                    w["plugin_status"] = "missing"
+                elif w["id"] in runtime.snapshot.records:
+                    w["plugin_status"] = "active"
+                else:
+                    w["plugin_status"] = "loaded"
             self._send(200, json.dumps(weapons, ensure_ascii=False).encode(),
                        "application/json")
         elif parsed.path == "/api/cm_actions":
@@ -1211,6 +1471,7 @@ def main():
                  else " — 生产部署请立即改密或设 ADMIN_PASSWORD"))
     from services import alerter
     alerter.CONFIG.update(DB.all_settings())
+    _apply_deepteam_env()
     # 保留策略: 启动即清 + 每小时清理
     def _retention_loop():
         while True:

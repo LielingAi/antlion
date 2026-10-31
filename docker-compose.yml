@@ -9,7 +9,10 @@
 
 services:
   sensor:
-    build: .
+    build:
+      context: .
+      args:
+        INSTALL_DEEPTEAM: ${INSTALL_DEEPTEAM:-0}
     command: python main.py --server --port 8080
     environment:
       HONEYPOT_HIVE_URL: http://hive:8899
@@ -24,15 +27,18 @@ services:
     restart: unless-stopped
 
   hive:
-    build: .
-    command: python experiments/dashboard.py --db /data/hive.sqlite --port 8899
+    build:
+      context: .
+      args:
+        INSTALL_DEEPTEAM: ${INSTALL_DEEPTEAM:-0}
+    command: python experiments/dashboard.py --db /data/hive.sqlite --port 8899 --host 0.0.0.0
     environment:
       HONEYPOT_CONSOLE_TOKEN: ${HONEYPOT_CONSOLE_TOKEN:?set HONEYPOT_CONSOLE_TOKEN}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?set ADMIN_PASSWORD}
     volumes:
       - hive-data:/data
     ports:
-      - "8899:8899"
+      - "18899:8899"             # 避开宿主机已有 8899 服务; 容器内仍为 8899
     restart: unless-stopped
 
 volumes:

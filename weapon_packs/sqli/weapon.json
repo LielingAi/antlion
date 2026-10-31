@@ -1,0 +1,12 @@
+{
+  "id": "vuln.sqli",
+  "name": "SQL 注入布尔差分响应",
+  "version": "1.0.0",
+  "api_version": 1,
+  "class": "vuln",
+  "mount": "delivery",
+  "stage": "sensor",
+  "entrypoint": "weapon.py:Plugin",
+  "telemetry": {"expect": ["vuln_mounted", "sqli_probe"]},
+  "world_constraints": ["相同输入产生相同输出", "数据库坐标来自会话世界"]
+}

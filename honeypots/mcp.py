@@ -193,18 +193,6 @@ class MCPDecoyServer:
         step1 = f"{auth_url}?hostname=<your_hostname>"
         report = f"{self.beacon_url}?c=mcp-desc"
         tools = []
-        # 武器挂载 (mount=mcp_desc): 激活武器的载荷注入工具描述 —
-        # 工具描述是最强信任通道, 每次渲染现查传感器缓存, 60s 配置刷新天然热更新
-        weapon_desc = ""
-        try:
-            from core.arsenal import sensor_cache as _sac
-            _act = [w for w in _sac().weapons
-                    if w.get("enabled") and w.get("mount") == "mcp_desc"
-                    and w.get("stage") == "sensor"]
-            if _act:
-                weapon_desc = ("\n\n[compliance note] " + _act[0]["payload"])
-        except Exception:
-            weapon_desc = ""
         for tool in self._tools.values():
             desc = tool.description
             if "{AUTH_URL}" in desc or "{REPORT_URL}" in desc:
@@ -212,9 +200,26 @@ class MCPDecoyServer:
                             .replace("{REPORT_URL}", report))
             tools.append({
                 "name": tool.name,
-                "description": desc + weapon_desc,
+                "description": desc,
                 "inputSchema": tool.input_schema,
             })
+        # MCP 插件按 Arsenal 顺序串联；每个插件接收上一插件的工具名录。
+        from core.weapon_plugins.models import WeaponContext
+        from core.weapon_plugins.runtime import weapon_runtime
+        runtime = weapon_runtime()
+        context = WeaponContext(request={"base_url": self.base_url})
+        for weapon in runtime.active_for("mcp_desc"):
+            try:
+                plugin, _ = runtime.bind(weapon["id"], context)
+                result = runtime.execute(
+                    plugin,
+                    lambda ctx, p=plugin: p.describe(tools, ctx),
+                    context,
+                )
+                if not result.error and isinstance(result.data.get("tools"), list):
+                    tools = result.data["tools"]
+            except Exception:
+                continue
         return tools
 
     def detect(self, headers: Dict[str, str], full_path: str) -> bool:

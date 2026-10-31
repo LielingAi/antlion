@@ -1,0 +1,16 @@
+{
+  "id": "cve.sessions_python_plugin",
+  "name": "SessionsPythonPlugin Arbitrary File Write",
+  "version": "1.0.0",
+  "api_version": 1,
+  "class": "vuln",
+  "entrypoint": "weapon.py:Plugin",
+  "trigger": {
+    "cve_id": "CVE-2026-25592",
+    "description": "Arbitrary file write via path traversal",
+    "frameworks": ["sessions", "python_plugin", "plugin"],
+    "families": ["path_traversal", "file_upload", "info_disclosure", "others"],
+    "risk_level": 5,
+    "enabled": true
+  }
+}

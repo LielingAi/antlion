@@ -204,8 +204,8 @@ class ExperimentRunner:
         print("\n[Scenario 4] L3 CVE Weaponization — LangChain CSV Agent")
 
         # 获取 CVE-2026-27966 的 payload
-        from cve_plugins.loader import CVEPluginLoader
-        loader = CVEPluginLoader()
+        from core.weapon_plugins.cve import CVECatalog
+        loader = CVECatalog()
         plugins = loader.find_for_framework("langchain", enabled_only=True)
 
         if not plugins:
@@ -252,8 +252,8 @@ class ExperimentRunner:
         """S5: L3 CVE — Semantic Kernel eval RCE"""
         print("\n[Scenario 5] L3 CVE Weaponization — Semantic Kernel eval()")
 
-        from cve_plugins.loader import CVEPluginLoader
-        loader = CVEPluginLoader()
+        from core.weapon_plugins.cve import CVECatalog
+        loader = CVECatalog()
         plugins = loader.find_for_framework("semantic_kernel", enabled_only=True)
 
         if not plugins:

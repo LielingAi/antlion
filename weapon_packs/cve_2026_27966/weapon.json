@@ -1,0 +1,16 @@
+{
+  "id": "cve.langchain_csv_agent",
+  "name": "LangChain CSV Agent RCE",
+  "version": "1.0.0",
+  "api_version": 1,
+  "class": "vuln",
+  "entrypoint": "weapon.py:Plugin",
+  "trigger": {
+    "cve_id": "CVE-2026-27966",
+    "description": "Python code injection via CSV cell parsing",
+    "frameworks": ["langchain", "csv", "agent"],
+    "families": ["sqli", "file_upload", "xss", "info_disclosure", "others"],
+    "risk_level": 5,
+    "enabled": true
+  }
+}

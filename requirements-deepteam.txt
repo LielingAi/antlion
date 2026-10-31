@@ -1,0 +1,5 @@
+# 可选：DeepTeam 武器工艺桥接
+# 基础蜜罐与测试不依赖此包；Docker 构建 INSTALL_DEEPTEAM=1 时安装。
+deepteam==1.0.10
+# DeepTeam telemetry.py 在导入时强制使用，但上游未声明该运行时依赖。
+sentry-sdk>=2.0.0

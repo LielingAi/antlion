@@ -1,0 +1,16 @@
+{
+  "id": "cve.semantic_kernel_eval",
+  "name": "Semantic Kernel In-Memory Vector Store RCE",
+  "version": "1.0.0",
+  "api_version": 1,
+  "class": "vuln",
+  "entrypoint": "weapon.py:Plugin",
+  "trigger": {
+    "cve_id": "CVE-2026-26030",
+    "description": "RCE via eval() on unfiltered lambda expressions",
+    "frameworks": ["semantic", "sk", "semantic_kernel", "kernel"],
+    "families": ["sqli", "info_disclosure", "auth_bypass", "ssrf", "others"],
+    "risk_level": 5,
+    "enabled": true
+  }
+}

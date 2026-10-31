@@ -1,0 +1,17 @@
+{
+  "id": "deepteam.bridge",
+  "name": "DeepTeam 武器工艺桥接",
+  "version": "1.0.0",
+  "api_version": 1,
+  "class": "prompt",
+  "mount": "delivery",
+  "stage": "sensor",
+  "entrypoint": "weapon.py:Plugin",
+  "telemetry": {
+    "expect": ["deepteam_weapon_generated", "deepteam_weapon_delivered"]
+  },
+  "world_constraints": [
+    "同一会话固定生成配置与 payload",
+    "动作契约必须声明可观察的成功信号"
+  ]
+}

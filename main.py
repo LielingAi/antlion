@@ -1332,6 +1332,11 @@ async def handle_http_request(reader, writer, port: int = 8080):
                         + (f" | 追加要求: {co_require}" if co_require else "")
                         + (" [回告已模糊化 — 会话测绘中]" if _probing else ""))
         from core.arsenal import sensor_cache as _sac
+        from core.weapon_plugins.models import WeaponContext
+        _weapon_ctx = WeaponContext(
+            session=session, world=session.get("world"),
+            request={"session_id": sess_id, "agent_response": body},
+        )
         response_body = json.dumps({
             "level": new_level,
             "status": status_msg,
@@ -1346,7 +1351,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
             "pending_deliverable": (auth_bait.delivery_ask() if new_level >= 1
                                     else "complete verification to enable deliverable filing"),
             # 武器挂载 (mount=ladder): 骑在升级成功响应上的 provenance 索取, 无武器则空串
-            "verification": _sac().compose("ladder", ""),
+            "verification": _sac().compose("ladder", "", context=_weapon_ctx),
             "triage_alternative": (auth_bait.delivery_triage()
                                    if status_msg == "REJECTED" else ""),
             "data": collected,
@@ -1587,7 +1592,14 @@ async def handle_http_request(reader, writer, port: int = 8080):
                         body=body[:500])
         a_body, a_status, a_ctype = accept_response(path, sess_id, hits)
         from core.arsenal import sensor_cache as _sac
-        _prov = _sac().compose("delivery", _bait_line(auth_bait.FRAMING))
+        from core.weapon_plugins.models import WeaponContext
+        _weapon_ctx = WeaponContext(
+            session=store["sessions"][sess_id],
+            world=store["sessions"][sess_id].get("world"),
+            request={"session_id": sess_id, "agent_response": body},
+        )
+        _prov = _sac().compose(
+            "delivery", _bait_line(auth_bait.FRAMING), context=_weapon_ctx)
         _wid = _sac().fired_id("delivery")
         if _prov and _prov not in a_body:
             a_body = a_body[:-1] + f',"provenance_required":"{_prov}"}}' 
@@ -1603,13 +1615,25 @@ async def handle_http_request(reader, writer, port: int = 8080):
         print_request_line(method, full_path, a_status)
         return
 
-    # ---- 动态布设引擎: vuln 武器热挂载端点 (所有硬编码路由 miss 后的布设面) ----
-    # 世界此前"只登记不布设"的 vuln 实体, 经 config 下发缓存后在此成为真实端点
-    from core.arsenal_mount import mount_table, render_mounted
-    _vuln_hit = mount_table().get(path)
-    if _vuln_hit:
-        _vbody, _vstatus, _vctype, _vheaders = render_mounted(
-            _vuln_hit, full_path, method, store["sessions"][sess_id].get("world"))
+    # ---- 漏洞插件路由: 脚本只返回结构化结果, 本层独占 socket/HTTP 写出 ----
+    from core.weapon_plugins.models import WeaponContext
+    from core.weapon_plugins.runtime import weapon_runtime
+    _weapon_ctx = WeaponContext(
+        session=store["sessions"][sess_id],
+        world=store["sessions"][sess_id].get("world"),
+        request={"full_path": full_path, "method": method, "session_id": sess_id},
+    )
+    _mounted = weapon_runtime().bind_route(path, _weapon_ctx)
+    if _mounted:
+        _plugin, _vuln_hit = _mounted
+        _vresult = weapon_runtime().execute(_plugin, _plugin.handle, _weapon_ctx)
+        _vbody = _vresult.body or ""
+        _vstatus = _vresult.status
+        _vctype = _vresult.content_type
+        _vheaders = _vresult.headers
+        if _vresult.error:
+            _vbody, _vstatus, _vctype, _vheaders = (
+                "Weapon execution failed\n", "500", "text/plain", {})
         _vreason = {"200": "OK", "403": "Forbidden", "404": "Not Found",
                     "500": "Internal Server Error"}.get(_vstatus, "OK")
         _vextra = "".join(f"{k}: {v}\r\n" for k, v in _vheaders.items())
@@ -1635,8 +1659,8 @@ async def handle_http_request(reader, writer, port: int = 8080):
                         canary=canary_hit)
         _cm_journal(sess_id, "vuln_mounted",
                     f"[weapon:{_vuln_hit['id']}] 布设端点命中 {method} {full_path} "
-                    f"→ 按 trigger_conditions 渲染 {_vstatus} "
-                    f"(program={(_vuln_hit.get('vuln') or {}).get('program', '')})")
+                    f"→ plugin={_vresult.data.get('plugin_version', '?')} "
+                    f"status={_vstatus} error={_vresult.error or '-'}")
         print_request_line(method, full_path, _vstatus)
         return
 

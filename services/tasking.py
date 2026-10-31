@@ -73,9 +73,15 @@ class TaskingManager:
             for i, (instr, te, re_) in enumerate(TASK_LIBRARY, start=1):
                 q.append(_mk_task(f"cal-{i}", i, instr, te, re_, "calibration"))
             try:
-                from core.arsenal import sensor_cache
-                for w in sensor_cache().active_for("tasking"):
-                    q.append(_mk_task(w["id"], len(q) + 1, w["payload"],
+                from core.weapon_plugins.models import WeaponContext
+                from core.weapon_plugins.runtime import weapon_runtime
+                runtime = weapon_runtime()
+                context = WeaponContext(session={"id": session_id})
+                for w in runtime.active_for("tasking"):
+                    result = runtime.render(w["id"], context)
+                    if result.error or not result.payload:
+                        continue
+                    q.append(_mk_task(w["id"], len(q) + 1, result.payload,
                                       w.get("tier_effect", MANUAL_TIER_EFFECT),
                                       w.get("refuse_effect", MANUAL_REFUSE_EFFECT),
                                       "arsenal"))

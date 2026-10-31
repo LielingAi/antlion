@@ -425,14 +425,6 @@ class MemoryPoisoning:
 class CountermeasureService:
     """反制服务主入口"""
 
-    # L3 CVE 插件与适用攻击族的联合匹配映射
-    # 用于框架匹配后的二次过滤：Agent 框架 + 攻击族 → 精准 CVE 触发
-    CVE_FAMILY_MAP = {
-        "CVE-2026-27966": {"sqli", "file_upload", "xss", "info_disclosure", "others"},
-        "CVE-2026-26030": {"sqli", "info_disclosure", "auth_bypass", "ssrf", "others"},
-        "CVE-2026-25592": {"path_traversal", "file_upload", "info_disclosure", "others"},
-    }
-
     # L1 策略优先级：高优先级策略优先匹配
     L1_STRATEGY_PRIORITY = ["xss", "sqli", "file_upload", "path_traversal", "auth_bypass"]
 
@@ -443,8 +435,8 @@ class CountermeasureService:
         self.l2_prompt = ReversePromptWeaponizer()
         self.l2_memory = MemoryPoisoning()
         try:
-            from cve_plugins.loader import CVEPluginLoader
-            self.cve_loader = CVEPluginLoader()
+            from core.weapon_plugins.cve import CVECatalog
+            self.cve_loader = CVECatalog()
         except Exception as e:
             print(f"[CVE Plugin] 加载失败: {e}")
             self.cve_loader = None
@@ -457,10 +449,9 @@ class CountermeasureService:
                 return preferred
         return "default"
 
-    def _match_cve_to_families(self, cve_id: str, families: List[str]) -> bool:
-        """判断 CVE 插件是否适用于当前攻击族"""
-        applicable = self.CVE_FAMILY_MAP.get(cve_id, set())
-        return bool(applicable & set(families))
+    def _match_cve_to_families(self, plugin, families: List[str]) -> bool:
+        """攻击族匹配规则由插件 manifest.trigger.families 声明。"""
+        return plugin.matches_families(families)
 
     def execute(
         self,
@@ -629,7 +620,7 @@ class CountermeasureService:
             if matched_plugins:
                 for plugin in matched_plugins:
                     # 联合匹配：框架匹配后，进一步检查攻击族适用性
-                    if not self._match_cve_to_families(plugin.cve_id, family_list):
+                    if not self._match_cve_to_families(plugin, family_list):
                         logs.append(f"L3: {plugin.cve_id} framework matched but attack family {family_set} not applicable")
                         continue
                     payload = plugin.craft_payload(beacon_server=beacon_srv)
@@ -673,7 +664,7 @@ class CountermeasureService:
             return []
         result = []
         for p in self.cve_loader.list_plugins(enabled_only=enabled_only):
-            result.append(p.info)
+            result.append(p.info())
         return result
 
     def reload_cves(self) -> bool:

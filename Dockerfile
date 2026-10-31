@@ -1,7 +1,13 @@
-# AI 蜜罐 — 全栈容器 (零第三方依赖, 无需 pip install)
+# AI 蜜罐 — 全栈容器
 FROM python:3.13-slim
 
 WORKDIR /app
+ARG INSTALL_DEEPTEAM=0
+COPY requirements.txt requirements-deepteam.txt ./
+RUN pip install --no-cache-dir -r requirements.txt \
+    && if [ "$INSTALL_DEEPTEAM" = "1" ]; then \
+         pip install --no-cache-dir -r requirements-deepteam.txt; \
+       fi
 COPY . .
 
 ENV PYTHONUNBUFFERED=1 \

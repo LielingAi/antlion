@@ -2366,7 +2366,7 @@ class TestProductP2:
         db = TestDB(str(tmp_path / "ars.sqlite"))
         ars = Arsenal(db)
         ws = ars.list()
-        assert len(ws) == 10 and any(w["id"] == "W-PROMPT-PROV-1" for w in ws)
+        assert len(ws) == 12 and any(w["id"] == "W-PROMPT-PROV-1" for w in ws)
         assert any(w["id"] == "W-PROMPT-CERT-1" and w["mount"] == "ladder"
                    for w in ws)
         # 激活分片武器
@@ -2446,15 +2446,19 @@ class TestProductP2:
         assert all(w.get("class") == "prompt" for w in ws
                    if w["id"].startswith("W-PROMPT"))
         assert next(w for w in ws if w["id"] == "W-BEACON-STAGE2-1")["class"] == "cli"
-        # 旧库行 (v1 无 class 字段) — 读时自动派生, save 后持久化
+        # 旧库行 (v1 无 class 字段) — v5 save 时投影 class、插件引用和配置
         ars.save({"id": "W-LEGACY-X", "type": "prompt", "stage": "sensor",
                   "mount": "ladder", "payload": "legacy", "enabled": False})
-        assert ars.get("W-LEGACY-X")["class"] == "prompt"
+        legacy = ars.get("W-LEGACY-X")
+        assert legacy["class"] == "prompt"
+        assert legacy["plugin"] == "builtin.template_prompt"
+        assert legacy["config"] == {"template": "legacy"}
         raw = db.query("SELECT json FROM arsenal WHERE weapon_id='W-LEGACY-X'")[0]["json"]
-        assert '"class"' not in raw          # 派生不落库, save 时才写
-        assert ars.set_enabled("W-LEGACY-X", True)   # set_enabled→save 走 norm 后落库
-        assert '"class": "prompt"' in db.query(
-            "SELECT json FROM arsenal WHERE weapon_id='W-LEGACY-X'")[0]["json"]
+        assert '"class": "prompt"' in raw
+        assert '"plugin": "builtin.template_prompt"' in raw
+        assert ars.set_enabled("W-LEGACY-X", True)
+        assert legacy["lifecycle"] == "staged"
+        assert ars.get("W-LEGACY-X")["lifecycle"] == "active"
 
     def test_arsenal_v2_to_v3_migration(self, tmp_path):
         """migrate_v2_weapons: v2 行 (vuln.trigger/无 program) 转 v3 落库;
@@ -2516,7 +2520,7 @@ class TestProductP2:
         from core.testdb import TestDB
         db = TestDB(str(tmp_path / "ars_seed.sqlite"))
         ars = Arsenal(db)
-        assert db.get_setting("arsenal_seed_version") == SEED_VERSION == "v4"
+        assert db.get_setting("arsenal_seed_version") == SEED_VERSION == "v6"
         # 用户改动种子 (关闭) + 自建武器
         assert ars.set_enabled("W-PROMPT-PROV-1", False)
         ars.save({"id": "W-USER-1", "type": "prompt", "stage": "sensor",
@@ -2528,7 +2532,7 @@ class TestProductP2:
         # 覆盖用户激活态曾把 W-JS-BAIT-1 静默打回停用, SDK 战场诱饵消失)
         db.set_setting("arsenal_seed_version", "v2")
         ars2 = Arsenal(db)
-        assert db.get_setting("arsenal_seed_version") == "v4"
+        assert db.get_setting("arsenal_seed_version") == "v6"
         seed = ars2.get("W-PROMPT-PROV-1")
         assert seed["enabled"] is False                   # 用户关的, 覆盖后仍关
         assert seed["craft"]["goal"] == "核实授权"        # v3 craft 块就位
@@ -2555,7 +2559,7 @@ class TestProductP2:
             with op.open(urllib.request.Request(url + "/api/arsenal?token=m-tok"),
                          timeout=5) as r:
                 ws = json.loads(r.read())
-            assert len(ws) == 10
+            assert len(ws) == 12
             assert any(w["id"] == "W-PROMPT-CERT-1" for w in ws)
             assert any(w.get("class") == "vuln" and w["id"] == "VULN-TRAVERSAL-28413"
                        for w in ws)

@@ -179,12 +179,13 @@ async function viewFleet(ctx) {
 /* ---------- 配置 ---------- */
 async function viewConfig() {
   const root = h("div", {});
-  root.append(pageHead("配置", "告警渠道 · 数据保留 · 账户"));
+  root.append(pageHead("配置", "告警渠道 · DeepTeam 模型 · 数据保留 · 账户"));
 
   const alertCard = h("div", { class: "card pad", style: "max-width:680px" });
   const policyCard = h("div", { class: "card pad", style: "max-width:680px;margin-top:16px" });
+  const modelCard = h("div", { class: "card pad", style: "max-width:680px;margin-top:16px" });
   const userCard = h("div", { class: "card pad", style: "max-width:680px;margin-top:16px" });
-  root.append(alertCard, policyCard, userCard);
+  root.append(alertCard, policyCard, modelCard, userCard);
 
   async function load() {
     const c = await api.config();
@@ -271,6 +272,51 @@ async function viewConfig() {
         [["true", "开启 (消耗执行核心)"], ["false", "关闭"]], c.ladder_enabled || "true"),
       mkSel("假世界版本", "world_version",
         [["2", "v2 当前"], ["1", "v1 历史对照"]], c.world_version || "2"));
+
+    /* ---- DeepTeam 模型与凭据 ---- */
+    modelCard.innerHTML = "";
+    modelCard.append(h("div", { class: "t muted" },
+      "DeepTeam 模型 — 用于 generate、模型驱动增强和多轮推进"));
+    const provider = h("select", { disabled: !admin, "data-testid": "deepteam-provider" },
+      ...[["openai", "OpenAI"], ["deepseek", "DeepSeek"], ["anthropic", "Anthropic"],
+         ["google", "Google Gemini"], ["moonshotai", "Moonshot AI"], ["xai", "xAI"],
+         ["ollama", "Ollama（本地）"]].map(([v, label]) =>
+        h("option", { value: v, selected: c.deepteam_model_provider === v }, label)));
+    const model = h("input", { value: c.deepteam_simulator_model || "gpt-4o-mini",
+      disabled: !admin, "data-testid": "deepteam-model" });
+    const baseUrl = h("input", { value: c.deepteam_base_url || "", disabled: !admin,
+      placeholder: "可选，OpenAI 兼容端点或 Ollama URL" });
+    const apiKey = h("input", { type: "password", value: "", disabled: !admin,
+      autocomplete: "new-password", "data-testid": "deepteam-api-key",
+      placeholder: c.deepteam_api_key_set ? "已配置，留空保持不变" : "输入 API Key" });
+    const clearKey = h("input", { type: "checkbox", disabled: !admin || !c.deepteam_api_key_set,
+      "data-testid": "deepteam-clear-key" });
+    modelCard.append(
+      mk("供应商", provider), mk("Simulator model", model), mk("Base URL", baseUrl),
+      mk("API Key", apiKey),
+      h("label", { style: "display:flex;gap:7px;align-items:center;font-size:11.5px" },
+        clearKey, h("span", { class: "muted" }, "清除已保存的 API Key")),
+      h("div", { class: "faint", style: "font-size:11px" },
+        c.deepteam_api_key_set
+          ? "凭据已保存；留空不会覆盖。API Key 不返回浏览器，并通过受保护配置通道下发 Sensor。"
+          : "API Key 仅用于服务端模型调用，保存后不会回显；Ollama 可留空。"),
+      h("div", { class: "toolbar", style: "margin-top:12px" },
+        h("button", { class: "btn primary", disabled: !admin,
+          "data-testid": "deepteam-model-save", onclick: async () => {
+            const payload = {
+              deepteam_model_provider: provider.value,
+              deepteam_simulator_model: model.value,
+              deepteam_base_url: baseUrl.value,
+            };
+            if (clearKey.checked) payload.deepteam_api_key_clear = true;
+            else if (apiKey.value) payload.deepteam_api_key = apiKey.value;
+            try {
+              await api.saveConfig(payload);
+              toast("DeepTeam 模型配置已保存并下发");
+              apiKey.value = "";
+              load();
+            } catch (e) { toast(e.message, "err"); }
+          } }, "保存模型配置")));
 
     /* ---- 账户管理 ---- */
     userCard.append(h("div", { class: "t muted" }, "账户"));
@@ -930,11 +976,17 @@ const OBJECT_BTNS = [["content", "内容"], ["output", "输出"],
 /* 构建器 (异步: 需拉世界表面目录 + 武器库) — existing 非空 = 编辑预填 */
 async function weaponBuilder(existing, { onDone, onCancel }) {
   let surface = [], arsenal = [];
+  let dtCatalog = { available: false, attacks: [], vulnerabilities: [] };
+  let pluginCatalog = { plugins: [] };
   try { surface = (await api.get("world/surface")).surface || []; } catch (_) {}
   try { arsenal = await api.get("arsenal"); } catch (_) {}
+  try { dtCatalog = await api.get("deepteam/catalog"); } catch (_) {}
+  try { pluginCatalog = await api.get("weapon_plugins"); } catch (_) {}
   const isEdit = !!(existing && existing.id);
   const v0 = (existing && existing.vuln) || {};
   const t0 = (existing && existing.exp) || {};
+  const dt0 = (existing && existing.config && existing.config.deepteam) || {};
+  const action0 = (existing && existing.config && existing.config.action) || {};
   const st = {
     step: isEdit ? 2 : 1,
     cls: (existing && (existing.class || existing.type)) || null,
@@ -962,6 +1014,21 @@ async function weaponBuilder(existing, { onDone, onCancel }) {
     craftGoal: (existing && existing.craft && existing.craft.goal) || "窃取提示词",
     craftApproach: (existing && existing.craft && existing.craft.approach) || "",
     cliBody: (existing && existing.class === "cli") ? (existing.payload || "") : "",
+    plugin: (existing && existing.plugin) || "",
+    useDeepTeam: (existing && existing.plugin === "deepteam.bridge") || false,
+    dtMode: dt0.mode || "enhance_only",
+    dtAttack: dt0.attack || "PromptInjection",
+    dtVulnerability: dt0.vulnerability || ((existing && existing.class === "vuln") ? "SQLInjection" : "PromptLeakage"),
+    dtTargetPurpose: dt0.target_purpose || "",
+    dtMultiTurn: !!dt0.multi_turn,
+    dtGoal: action0.goal || ((existing && existing.class === "vuln") ? "数据" : "提示词"),
+    dtExpected: action0.expected || "Agent 执行 payload 指定的动作",
+    dtSignals: (action0.success_signal || []).join(",") ||
+      ((existing && existing.class === "vuln") ? "request:/api/query" : "prompt_captured"),
+    dtWorldReqs: (action0.world_requirements || []).join(","),
+    dtNextStage: action0.next_stage || "",
+    dtSimulator: (existing && existing.config && existing.config.generation
+      && existing.config.generation.simulator_model) || "gpt-4o-mini",
   };
   const err = h("div", { style: "color:var(--bad);font-size:11.5px;min-height:14px" });
   const stepBox = h("div", {});
@@ -1031,6 +1098,87 @@ async function weaponBuilder(existing, { onDone, onCancel }) {
     while (ids.has(`${pre}-${n}`)) n += 1;
     return `${pre}-${n}`;
   }
+  function deepTeamEditor() {
+    const enabled = h("input", { type: "checkbox", checked: st.useDeepTeam,
+      "data-testid": "deepteam-toggle" });
+    enabled.onchange = () => { st.useDeepTeam = enabled.checked; renderStep2(); };
+    const box = h("div", { class: "card pad", style: "display:grid;gap:7px;border-color:var(--border2)" },
+      h("label", { style: "display:flex;gap:8px;align-items:center;font-weight:650" },
+        enabled, h("span", {}, "使用 DeepTeam 武器工艺"),
+        h("span", { class: "faint", style: "font-size:10.5px;font-weight:400" },
+          dtCatalog.available ? "动态攻击与漏洞目录" : "未安装可选依赖")));
+    if (!st.useDeepTeam) {
+      const pluginS = sel([
+        ["", "按类别自动选择"],
+        ...pluginCatalog.plugins.map((p) => [p.id, `${p.name} (${p.id})`]),
+      ], st.plugin);
+      pluginS.dataset.testid = "weapon-plugin-select";
+      pluginS.onchange = () => { st.plugin = pluginS.value; };
+      box.append(lab("实现插件（包括上传的自定义包）"), pluginS);
+      return box;
+    }
+
+    const attackOptions = dtCatalog.attacks.length
+      ? dtCatalog.attacks.filter((a) => !!a.multi_turn === st.dtMultiTurn)
+      : (st.dtMultiTurn
+          ? [{ id: "LinearJailbreaking", name: "Linear Jailbreaking", multi_turn: true }]
+          : [{ id: "PromptInjection", name: "Prompt Injection", multi_turn: false }]);
+    if (!attackOptions.some((a) => a.id === st.dtAttack)) attackOptions.unshift({
+      id: st.dtAttack, name: st.dtAttack, multi_turn: st.dtMultiTurn,
+    });
+    const attackS = sel(attackOptions.map((a) => [a.id, a.name]), st.dtAttack);
+    attackS.onchange = () => { st.dtAttack = attackS.value; };
+    const modeS = sel([["enhance_only", "增强现有 payload"], ["generate", "从漏洞动态生成"]], st.dtMode);
+    modeS.onchange = () => { st.dtMode = modeS.value; renderStep2(); };
+    const multi = h("input", { type: "checkbox", checked: st.dtMultiTurn });
+    multi.onchange = () => {
+      st.dtMultiTurn = multi.checked;
+      st.dtAttack = multi.checked ? "LinearJailbreaking" : "PromptInjection";
+      renderStep2();
+    };
+    const purposeI = inp("目标用途 target_purpose（引导生成器理解反制场景）", st.dtTargetPurpose);
+    purposeI.oninput = () => { st.dtTargetPurpose = purposeI.value; };
+    const goalS = sel([["数据", "数据"], ["提示词", "提示词"], ["控制", "控制"]], st.dtGoal);
+    goalS.onchange = () => { st.dtGoal = goalS.value; };
+    const expectedI = inp("预期 Agent 动作", st.dtExpected);
+    expectedI.oninput = () => { st.dtExpected = expectedI.value; };
+    const signalsI = inp("成功信号（逗号分隔，如 request:/api/query,prompt_captured）", st.dtSignals);
+    signalsI.oninput = () => { st.dtSignals = signalsI.value; };
+    const worldI = inp("世界依赖（逗号分隔，如 endpoint:/api/query）", st.dtWorldReqs);
+    worldI.oninput = () => { st.dtWorldReqs = worldI.value; };
+    const nextI = inp("下一阶段武器 ID（可空）", st.dtNextStage);
+    nextI.oninput = () => { st.dtNextStage = nextI.value; };
+    const simI = inp("simulator model", st.dtSimulator, true);
+    simI.oninput = () => { st.dtSimulator = simI.value; };
+    box.append(
+      h("div", { class: "muted", style: "font-size:11.5px" },
+        "生成 payload + 动作契约 = 可试射、可激活、可计量的反制武器"),
+      row2(modeS, attackS),
+      h("label", { style: "display:flex;gap:8px;align-items:center;font-size:12px" },
+        multi, h("span", {}, "多轮事件驱动推进（按会话保存状态）")),
+      purposeI);
+    if (st.dtMode === "generate") {
+      const vulnOptions = dtCatalog.vulnerabilities.length
+        ? dtCatalog.vulnerabilities
+        : [{ id: st.dtVulnerability, name: st.dtVulnerability }];
+      if (!vulnOptions.some((v) => v.id === st.dtVulnerability)) vulnOptions.unshift({
+        id: st.dtVulnerability, name: st.dtVulnerability,
+      });
+      const vulnS = sel(vulnOptions.map((v) => [v.id, v.name]), st.dtVulnerability);
+      vulnS.onchange = () => { st.dtVulnerability = vulnS.value; };
+      box.append(lab("DeepTeam Vulnerability"), vulnS);
+    } else {
+      box.append(h("div", { class: "faint", style: "font-size:11px" },
+        st.cls === "prompt" ? "基础 payload 使用上方话术本体" : "基础 payload 使用上方 payload 模板"));
+    }
+    box.append(
+      lab("动作契约"),
+      row2(goalS, expectedI),
+      signalsI, worldI,
+      row2(nextI, simI));
+    return box;
+  }
+
   function renderStep2() {
     const c = WEAPON_CLASSES[st.cls];
     head.textContent = isEdit ? `编辑武器 · ${st.id}` : `新建 · ${c.icon} ${c.label}`;
@@ -1193,6 +1341,7 @@ async function weaponBuilder(existing, { onDone, onCancel }) {
     }
 
     stepBox.replaceChildren(common, specific,
+      (st.cls === "prompt" || st.cls === "vuln") ? deepTeamEditor() : null,
       h("div", { style: "display:flex;gap:8px;justify-content:flex-end;margin-top:12px" },
         h("button", { class: "btn", onclick: () => { st.step = 1; render(); } }, "← 重选类别"),
         h("button", { class: "btn primary", onclick: () => {
@@ -1205,7 +1354,8 @@ async function weaponBuilder(existing, { onDone, onCancel }) {
     if (st.cls === "vuln") {
       if (!st.program.trim()) return "目标程序必填 — 利用方案的知识本体";
       if (!st.trigCond.trim()) return "触发条件必填 — 什么输入状态下漏洞被触发";
-      if (!st.payloadTpl.trim()) return "payload 模板必填 — 利用请求的样板";
+      if ((!st.useDeepTeam || st.dtMode === "enhance_only") && !st.payloadTpl.trim())
+        return "payload 模板必填 — 利用请求的样板";
       if (!st.successCrit.trim()) return "成功判据必填 — 什么回显算利用成功";
     }
     if (st.cls === "exp") {
@@ -1217,23 +1367,59 @@ async function weaponBuilder(existing, { onDone, onCancel }) {
           return `步骤 ${(st.stages.indexOf(s) + 1)} 缺名称/原语/投递对象`;
       }
     }
-    if (st.cls === "prompt" && !st.body.trim()) return "话术本体不能为空";
+    if (st.cls === "prompt" && (!st.useDeepTeam || st.dtMode === "enhance_only") && !st.body.trim())
+      return "话术本体不能为空";
     if (st.cls === "cli" && !st.cliBody.trim()) return "载荷不能为空";
+    if (st.useDeepTeam) {
+      if (!st.dtAttack.trim()) return "请选择 DeepTeam 攻击工艺";
+      if (st.dtMode === "generate" && !st.dtVulnerability.trim()) return "请选择 DeepTeam 漏洞";
+      if (!st.dtExpected.trim()) return "动作契约缺少预期 Agent 动作";
+      if (!st.dtSignals.trim()) return "动作契约至少需要一个成功信号";
+    }
     return "";
   }
   function finalPayload() {
     return (MORPH_PROFILES[st.morph] || ["", ""])[1] + (st.body || "");
   }
 
+  function withDeepTeam(weapon, basePayload) {
+    if (!st.useDeepTeam) return weapon;
+    const worldRequirements = st.dtWorldReqs.split(",").map((v) => v.trim()).filter(Boolean);
+    if (st.worldEp && !worldRequirements.includes(`endpoint:${st.worldEp}`)) {
+      worldRequirements.push(`endpoint:${st.worldEp}`);
+    }
+    const deepteam = {
+      mode: st.dtMode,
+      attack: st.dtAttack,
+      target_purpose: st.dtTargetPurpose,
+    };
+    if (st.dtMode === "enhance_only") deepteam.base_payload = basePayload;
+    else deepteam.vulnerability = st.dtVulnerability;
+    if (st.dtMultiTurn) deepteam.multi_turn = true;
+    return { ...weapon, plugin: "deepteam.bridge", config: {
+      deepteam,
+      action: {
+        goal: st.dtGoal,
+        expected: st.dtExpected,
+        success_signal: st.dtSignals.split(",").map((v) => v.trim()).filter(Boolean),
+        world_requirements: worldRequirements,
+        next_stage: st.dtNextStage,
+      },
+      generation: { cache: "session", simulator_model: st.dtSimulator },
+    } };
+  }
+
   /* ---------- 第 3 步: 摘要 + 世界模拟预览 + 保存 ---------- */
   function buildWeapon() {
     const base = { id: st.id.trim(), name: st.name.trim() || st.id.trim(),
-      class: st.cls, stage: st.stage, enabled: st.enabled, note: st.note.trim() };
+      class: st.cls, stage: st.stage, enabled: st.enabled, note: st.note.trim(),
+      plugin: st.plugin || undefined };
     if (st.cls === "prompt") {
       const morphLabel = MORPH_PROFILES[st.morph][0];
-      return { ...base, type: "prompt", mount: st.mount, payload: finalPayload(),
+      return withDeepTeam({ ...base, type: "prompt", mount: st.mount,
+        payload: finalPayload() || "DeepTeam generated payload",
         craft: { goal: st.craftGoal, approach: st.craftApproach },
-        note: base.note + (st.morph !== "none" ? ` · 变形档:${morphLabel}` : "") };
+        note: base.note + (st.morph !== "none" ? ` · 变形档:${morphLabel}` : "") }, finalPayload());
     }
     if (st.cls === "vuln") {
       const vuln = { program: st.program, cve_id: st.cve,
@@ -1245,8 +1431,8 @@ async function weaponBuilder(existing, { onDone, onCancel }) {
         source: st.source, confidence: st.confidence,
         behavior_note: st.behaviorNote, exp_refs: [] };
       if (st.worldEp) vuln.deploy = { world_endpoint: st.worldEp };
-      return { ...base, type: "vuln", mount: "delivery",
-        payload: "knowledge entity — see vuln block", vuln };
+      return withDeepTeam({ ...base, type: "vuln", mount: "delivery",
+        payload: "knowledge entity — see vuln block", vuln }, st.payloadTpl);
     }
     if (st.cls === "exp") {
       return { ...base, type: "vuln", mount: "delivery",
@@ -1279,6 +1465,8 @@ async function weaponBuilder(existing, { onDone, onCancel }) {
         : []),
       ...(st.cls === "prompt" ? [["挂载", st.mount], ["反制意图", st.craftGoal],
         ["变形", MORPH_PROFILES[st.morph][0]]] : []),
+      ...(st.useDeepTeam ? [["DeepTeam", `${st.dtAttack} · ${st.dtMode}`],
+        ["动作契约", st.dtExpected], ["成功信号", st.dtSignals]] : []),
     ]);
     let sim = null;
     if (st.cls === "vuln") {
@@ -1389,23 +1577,35 @@ function weaponCardFooter(w, { onChanged, onEdit }) {
       await api.post("arsenal", { action: "toggle", id: w.id, enabled: tog.checked });
       toast(`${w.name || w.id} ${tog.checked ? "已激活 — 60s 内下发全网传感器" : "已停用"}`);
       onChanged();
-    } catch (e) { toast(e.message, "err"); }
+    } catch (e) { toast(e.message, "err"); tog.checked = !tog.checked; }
   });
+  const status = w.plugin_error ||
+    `${w.plugin || "declarative"}@${w.plugin_version || "-"} · ${w.plugin_status || "unknown"}`;
   return [
     h("label", { class: "switch", style: "margin-left:auto",
       onclick: (e) => e.stopPropagation() }, tog, h("span", { class: "slider" })),
-    h("div", { style: "display:flex;gap:6px;justify-content:flex-end;margin-top:8px" },
-      h("button", { class: "btn", style: "padding:3px 10px;font-size:11.5px",
-        onclick: (e) => { e.stopPropagation(); onEdit(); } }, "编辑"),
-      h("button", { class: "btn", style: "padding:3px 10px;font-size:11.5px",
-        onclick: async (e) => {
-          e.stopPropagation();
-          if (!window.confirm(`确认删除武器 ${w.name || w.id} (${w.id})?`)) return;
-          try {
-            await api.post("arsenal", { action: "delete", id: w.id });
-            toast("已删除"); onChanged();
-          } catch (e2) { toast(e2.message, "err"); }
-        } }, "删除"))];
+    h("div", { style: "margin-top:8px", onclick: (e) => e.stopPropagation() },
+      h("div", { class: w.plugin_error ? "mono" : "mono faint",
+        style: `font-size:10.5px;word-break:break-all;margin-bottom:6px${w.plugin_error ? ";color:var(--bad)" : ""}` }, status),
+      h("div", { style: "display:flex;gap:6px;justify-content:flex-end" },
+        h("button", { class: "btn", style: "padding:3px 10px;font-size:11.5px",
+          onclick: async () => {
+            try {
+              const result = await api.post("arsenal", { action: "test_fire", id: w.id });
+              toast(result.ok ? "试射通过" : `试射失败: ${result.error || "unknown"}`,
+                result.ok ? "ok" : "err");
+            } catch (e) { toast(e.message, "err"); }
+          } }, "试射"),
+        h("button", { class: "btn", style: "padding:3px 10px;font-size:11.5px",
+          onclick: () => onEdit() }, "编辑"),
+        h("button", { class: "btn", style: "padding:3px 10px;font-size:11.5px",
+          onclick: async () => {
+            if (!window.confirm(`确认删除武器 ${w.name || w.id} (${w.id})?`)) return;
+            try {
+              await api.post("arsenal", { action: "delete", id: w.id });
+              toast("已删除"); onChanged();
+            } catch (e2) { toast(e2.message, "err"); }
+          } }, "删除")))];
 }
 
 /* 高亮同网格另一张卡 (EXP↔vuln 互跳), outline 1s */
@@ -1569,70 +1769,404 @@ function carrierWeaponCard(w, { onChanged, onEdit }) {
   return card;
 }
 
-async function viewArsenal(ctx) {
-  const root = h("div", {});
-  root.append(pageHead("武器库", "定义 → 下发 60s 全网生效 · 传感器=开口子 · deep=深层次"));
-  const count = h("span", { class: "count" });
-  const newBox = h("div", {});
-  const grid = h("div", { class: "grid c3", style: "margin-top:12px" });
-  let editing = null;   /* 正在编辑的武器 id (null=无) */
-  root.append(
-    h("div", { class: "toolbar" },
-      h("button", { class: "btn primary", onclick: () => openBuilder(null, newBox) },
-        "＋ 新建武器"), count),
-    newBox, grid);
+function arsenalPayload(w) {
+  if (w.class === "vuln") return JSON.stringify(w.vuln || {}, null, 2);
+  if (w.class === "exp") return JSON.stringify(w.exp || {}, null, 2);
+  return String(w.payload || "");
+}
 
-  const cardById = {};   /* id → 卡元素 (vuln↔EXP 互跳/新卡高亮用) */
-  let highlightId = null;
-  async function openBuilder(existing, target) {
-    const box = h("div", {}, h("div", { class: "card pad" }, skeleton(3)));
-    target.replaceChildren(box);
-    let b;
-    try { b = await weaponBuilder(existing, {
-      onDone: (savedId) => {
-        target.replaceChildren();
-        if (existing) editing = null;
-        highlightId = savedId || null;
-        load();
-      },
-      onCancel: () => { target.replaceChildren(); if (existing) { editing = null; load(); } } });
+function arsenalOverview(w) {
+  const cls = w.class || w.type || "prompt";
+  const pairs = [
+    ["武器 ID", w.id], ["实体类别", cls], ["阶段", w.stage || "sensor"],
+    ["挂载点", w.mount || "-"], ["生命周期", w.lifecycle || "-"],
+    ["插件", w.plugin || "declarative"], ["插件版本", w.plugin_version || "-"],
+  ];
+  if (cls === "vuln") {
+    const v = w.vuln || {};
+    pairs.push(["目标程序", v.program], ["利用原语", v.primitive],
+      ["CVE", v.cve_id || "-"], ["影响版本", v.affected_versions || "-"],
+      ["知识来源", `${v.source || "-"} · ${v.confidence || "-"}`],
+      ["投送端点", (v.deploy || {}).world_endpoint || "不布设"]);
+  } else if (cls === "exp") {
+    const e = w.exp || {};
+    pairs.push(["目标漏洞", e.targets_vuln], ["反制目标", e.objective],
+      ["步骤数", (e.stages || []).length], ["战果", e.success_effect],
+      ["链模式", e.mode === "ordered" ? "顺序推进" : "集合完成"]);
+  } else if (w.craft) {
+    pairs.push(["反制意图", w.craft.goal], ["策略", w.craft.approach]);
+  }
+  return kvList(pairs);
+}
+
+function arsenalListItem(w, selected, onSelect) {
+  const cls = w.class || w.type || "prompt";
+  const [kind, label] = WCLASS_PILL[cls] || ["dim", cls];
+  const hasError = !!w.plugin_error || w.plugin_status === "missing";
+  const hits = (w.effects || {}).hits || 0;
+  return h("button", {
+    type: "button",
+    class: `arsenal-item${selected ? " selected" : ""}${hasError ? " has-error" : ""}`,
+    "data-weapon-id": w.id,
+    onclick: () => onSelect(w.id),
+  },
+    h("span", { class: "arsenal-item-icon" }, WTYPE[w.type] || (cls === "exp" ? "⛁" : "·")),
+    h("span", { class: "arsenal-item-main" },
+      h("span", { class: "arsenal-item-name" }, w.name || w.id),
+      h("span", { class: "arsenal-item-id mono" }, w.id),
+      h("span", { class: "arsenal-item-meta" },
+        pill(label, kind),
+        h("span", { class: "mono" }, w.mount || "-"))),
+    h("span", { class: "arsenal-item-state" },
+      h("span", {
+        class: `state-dot ${hasError ? "bad" : w.enabled ? "ok" : "dim"}`,
+        title: hasError ? (w.plugin_error || "插件缺失") : w.enabled ? "已激活" : "未激活",
+      }),
+      hits ? h("span", { class: "mono", title: "命中次数" }, hits) : null));
+}
+
+function arsenalDetail(w, { onChanged, onEdit, onDelete, onSelect }) {
+  const cls = w.class || w.type || "prompt";
+  const [stageKind, stageLabel] = WSTAGE[w.stage] || ["dim", w.stage || "sensor"];
+  const hasError = !!w.plugin_error || w.plugin_status === "missing";
+  const resultBox = h("div", { class: "arsenal-test-result", hidden: true });
+  const tog = h("input", { type: "checkbox", checked: !!w.enabled });
+  tog.addEventListener("change", async () => {
+    tog.disabled = true;
+    try {
+      await api.post("arsenal", { action: "toggle", id: w.id, enabled: tog.checked });
+      toast(`${w.name || w.id} ${tog.checked ? "已激活" : "已停用"}`);
+      await onChanged();
     } catch (e) {
-      target.replaceChildren(h("div", { class: "empty" }, "构建器加载失败: " + e.message));
-      return;
+      tog.checked = !tog.checked;
+      toast(e.message, "err");
+    } finally { tog.disabled = false; }
+  });
+  const testBtn = h("button", { class: "btn" }, "试射");
+  testBtn.addEventListener("click", async () => {
+    testBtn.disabled = true;
+    testBtn.textContent = "试射中…";
+    resultBox.hidden = false;
+    resultBox.replaceChildren(h("div", { class: "muted" }, "正在独立运行时中执行…"));
+    try {
+      const result = await api.post("arsenal", { action: "test_fire", id: w.id });
+      resultBox.replaceChildren(
+        h("div", { class: "arsenal-test-head" },
+          pill(result.ok ? "试射通过" : "试射失败", result.ok ? "ok" : "bad"),
+          result.error ? h("span", { class: "mono" }, result.error) : null),
+        h("pre", {}, JSON.stringify(result.result || {}, null, 2)));
+      toast(result.ok ? "试射通过" : `试射失败: ${result.error || "unknown"}`,
+        result.ok ? "ok" : "err");
+    } catch (e) {
+      resultBox.replaceChildren(pill("试射请求失败", "bad"),
+        h("pre", {}, e.message));
+      toast(e.message, "err");
+    } finally {
+      testBtn.disabled = false;
+      testBtn.textContent = "试射";
     }
-    target.replaceChildren(b);
+  });
+  const links = [];
+  if (cls === "vuln") {
+    for (const id of (w.vuln || {}).exp_refs || []) {
+      links.push(h("button", { class: "ctl", onclick: () => onSelect(id) }, `EXP · ${id}`));
+    }
+  } else if (cls === "exp" && (w.exp || {}).targets_vuln) {
+    links.push(h("button", { class: "ctl", onclick: () => onSelect(w.exp.targets_vuln) },
+      `目标漏洞 · ${w.exp.targets_vuln}`));
   }
+  return h("section", { class: "arsenal-detail card", "data-testid": "arsenal-detail" },
+    h("div", { class: "arsenal-detail-head" },
+      h("div", { class: "arsenal-detail-title" },
+        h("span", { class: "arsenal-detail-icon" }, WTYPE[w.type] || (cls === "exp" ? "⛁" : "·")),
+        h("div", {},
+          h("h2", {}, w.name || w.id),
+          h("div", { class: "mono faint" }, w.id))),
+      h("label", { class: "switch arsenal-enable" }, tog,
+        h("span", { class: "slider" }), h("span", { class: "lbl" }, "激活"))),
+    h("div", { class: "arsenal-detail-tags" },
+      pill(cls === "exp" ? "EXP" : (WCLASS_PILL[cls] || ["dim", cls])[1],
+        cls === "exp" ? "purple" : (WCLASS_PILL[cls] || ["dim"])[0]),
+      pill(stageLabel, stageKind),
+      pill(hasError ? "插件异常" : w.enabled ? "已激活" : "未激活",
+        hasError ? "bad" : w.enabled ? "ok" : "dim"),
+      h("span", { class: "mono faint" }, w.mount || "-")),
+    w.note ? h("p", { class: "arsenal-note" }, w.note) : null,
+    h("div", { class: "arsenal-actionbar" },
+      testBtn,
+      h("button", { class: "btn primary", onclick: () => onEdit(w) }, "编辑武器"),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn danger", onclick: async () => {
+        if (!window.confirm(`确认删除武器 ${w.name || w.id} (${w.id})?`)) return;
+        try {
+          await api.post("arsenal", { action: "delete", id: w.id });
+          toast("已删除");
+          onDelete();
+        } catch (e) { toast(e.message, "err"); }
+      } }, "删除")),
+    resultBox,
+    h("div", { class: "arsenal-detail-section" },
+      h("h3", {}, "配置与效能"),
+      arsenalOverview(w),
+      effectBadges(w)),
+    hasError ? h("div", { class: "arsenal-error" }, w.plugin_error || "插件不存在") : null,
+    links.length ? h("div", { class: "arsenal-detail-section" },
+      h("h3", {}, "关联武器"),
+      h("div", { class: "arsenal-links" }, ...links)) : null,
+    h("div", { class: "arsenal-detail-section" },
+      h("h3", {}, cls === "vuln" || cls === "exp" ? "知识本体" : "载荷预览"),
+      h("pre", { class: "arsenal-payload" }, arsenalPayload(w))));
+}
+
+async function viewArsenal(ctx) {
+  const root = h("div", { class: "arsenal-page" });
+  root.append(pageHead("武器库", "选择武器查看详情 · 试射验证后再激活 · 60s 下发传感器"));
+  const summaryBox = h("div", { class: "arsenal-metrics" });
+  const count = h("span", { class: "count" });
+  const listBox = h("div", { class: "arsenal-list", "data-testid": "arsenal-list" });
+  const detailBox = h("div", { class: "arsenal-detail-slot" });
+  const search = h("input", {
+    class: "search arsenal-search", type: "search",
+    placeholder: "搜索名称、ID、插件或载荷…", "aria-label": "搜索武器",
+  });
+  const classFilter = h("select", { class: "ctl", "aria-label": "按类别筛选" },
+    ...[["all", "全部类别"], ["prompt", "提示词"], ["vuln", "漏洞"],
+       ["exp", "EXP"], ["mcp", "MCP"], ["cli", "CLI"]].map(([v, t]) =>
+      h("option", { value: v }, t)));
+  const statusFilter = h("select", { class: "ctl", "aria-label": "按状态筛选" },
+    ...[["all", "全部状态"], ["enabled", "已激活"], ["disabled", "未激活"],
+       ["error", "插件异常"]].map(([v, t]) => h("option", { value: v }, t)));
+  let weapons = [];
+  let selectedId = null;
+  let currentPage = 1;
+  let pageSize = 10;
+  const pageSizeSelect = h("select", {
+    class: "ctl arsenal-page-size", "aria-label": "每页武器数",
+    "data-testid": "arsenal-page-size",
+  }, ...[5, 10, 20, 50].map((size) =>
+    h("option", { value: size, selected: size === pageSize }, `${size} 条/页`)));
+  const prevBtn = h("button", {
+    class: "ctl", "data-testid": "arsenal-prev-page", "aria-label": "上一页",
+  }, "←");
+  const nextBtn = h("button", {
+    class: "ctl", "data-testid": "arsenal-next-page", "aria-label": "下一页",
+  }, "→");
+  const pageInfo = h("span", {
+    class: "count arsenal-page-info", "data-testid": "arsenal-page-info",
+  });
+
+  function filteredWeapons() {
+    const query = search.value.trim().toLowerCase();
+    return weapons.filter((w) => {
+      const cls = w.class || w.type || "prompt";
+      if (classFilter.value !== "all" && cls !== classFilter.value) return false;
+      const hasError = !!w.plugin_error || w.plugin_status === "missing";
+      if (statusFilter.value === "enabled" && !w.enabled) return false;
+      if (statusFilter.value === "disabled" && w.enabled) return false;
+      if (statusFilter.value === "error" && !hasError) return false;
+      if (!query) return true;
+      const haystack = [w.id, w.name, w.plugin, w.mount, w.note, arsenalPayload(w),
+        (w.vuln || {}).program].join(" ").toLowerCase();
+      return haystack.includes(query);
+    });
+  }
+
+  function selectWeapon(id) {
+    const rows = filteredWeapons();
+    const index = rows.findIndex((w) => w.id === id);
+    if (index >= 0) currentPage = Math.floor(index / pageSize) + 1;
+    selectedId = id;
+    renderWorkspace();
+    const item = listBox.querySelector(`[data-weapon-id="${CSS.escape(id)}"]`);
+    item?.scrollIntoView({ block: "nearest" });
+  }
+
+  function changePage(delta) {
+    currentPage += delta;
+    renderWorkspace();
+    listBox.scrollTop = 0;
+  }
+
+  function renderWorkspace() {
+    const rows = filteredWeapons();
+    const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+    currentPage = Math.min(Math.max(1, currentPage), totalPages);
+    const offset = (currentPage - 1) * pageSize;
+    const pageRows = rows.slice(offset, offset + pageSize);
+    count.textContent = `${rows.length} / ${weapons.length} 把`;
+    pageInfo.textContent = rows.length ? `${currentPage} / ${totalPages} 页` : "0 页";
+    prevBtn.disabled = currentPage <= 1 || !rows.length;
+    nextBtn.disabled = currentPage >= totalPages || !rows.length;
+    if (!pageRows.some((w) => w.id === selectedId)) selectedId = pageRows[0]?.id || null;
+    listBox.replaceChildren(...(pageRows.length
+      ? pageRows.map((w) => arsenalListItem(w, w.id === selectedId, selectWeapon))
+      : [h("div", { class: "empty" }, "没有匹配武器，试试调整筛选条件")]));
+    const selected = weapons.find((w) => w.id === selectedId);
+    detailBox.replaceChildren(selected
+      ? arsenalDetail(selected, {
+          onChanged: load,
+          onEdit: openBuilder,
+          onDelete: () => { selectedId = null; load(); },
+          onSelect: selectWeapon,
+        })
+      : h("div", { class: "card empty arsenal-no-selection" },
+          "选择一把武器查看配置、载荷和试射结果"));
+  }
+
+  function metric(label, value, kind = "") {
+    return h("div", { class: `arsenal-metric ${kind}` },
+      h("span", { class: "arsenal-metric-value mono" }, value),
+      h("span", { class: "arsenal-metric-label" }, label));
+  }
+
+  function renderSummary() {
+    const active = weapons.filter((w) => w.enabled).length;
+    const errors = weapons.filter((w) => w.plugin_error || w.plugin_status === "missing").length;
+    const hits = weapons.reduce((sum, w) => sum + ((w.effects || {}).hits || 0), 0);
+    summaryBox.replaceChildren(
+      metric("武器总数", weapons.length),
+      metric("已激活", active, active ? "ok" : ""),
+      metric("累计命中", hits, hits ? "info" : ""),
+      metric("插件异常", errors, errors ? "bad" : "ok"));
+  }
+
   async function load() {
-    let weapons = [];
-    try { weapons = await api.get("arsenal"); }
-    catch (e) {
-      grid.replaceChildren(h("div", { class: "empty" }, "加载失败: " + e.message));
-      return;
-    }
-    count.textContent = `${weapons.filter((w) => w.enabled).length} 激活 / ${weapons.length} 把`;
-    count.textContent += ` — prompt ${weapons.filter((w) => (w.class || w.type) === "prompt").length}`
-      + ` · vuln ${weapons.filter((w) => (w.class || w.type) === "vuln").length}`
-      + ` · exp ${weapons.filter((w) => w.class === "exp").length}`;
-    for (const k of Object.keys(cardById)) delete cardById[k];
-    const els = [];
-    for (const w of weapons) {
-      if (w.id === editing) {
-        const slot = h("div", {});
-        els.push(slot);
-        openBuilder(w, slot);   /* 编辑 = 向导第2步预填, 原地渲染 */
-        continue;
-      }
-      const card = weaponCard(w, { onChanged: load,
-        onEdit: () => { editing = w.id; load(); }, cards: cardById });
-      cardById[w.id] = card;
-      els.push(card);
-    }
-    grid.replaceChildren(...els);
-    if (highlightId && cardById[highlightId]) {
-      flashCard(cardById, highlightId);
-      highlightId = null;
+    try {
+      weapons = await api.get("arsenal");
+      if (selectedId && !weapons.some((w) => w.id === selectedId)) selectedId = null;
+      renderSummary();
+      renderWorkspace();
+    } catch (e) {
+      listBox.replaceChildren(h("div", { class: "empty" }, "加载失败: " + e.message));
+      detailBox.replaceChildren();
     }
   }
+
+  async function openBuilder(existing) {
+    const body = h("div", { class: "weapon-editor-body" }, skeleton(4));
+    const close = () => overlay.remove();
+    const overlay = h("div", { class: "weapon-editor", role: "dialog", "aria-modal": "true" },
+      h("div", { class: "weapon-editor-mask", onclick: close }),
+      h("div", { class: "weapon-editor-panel" },
+        h("div", { class: "weapon-editor-head" },
+          h("div", {},
+            h("h2", {}, existing ? "编辑武器" : "新建武器"),
+            h("div", { class: "faint" }, existing?.id || "三步完成定义、预览与保存")),
+          h("button", { class: "ctl", onclick: close }, "关闭")),
+        body));
+    root.append(overlay);
+    try {
+      const builder = await weaponBuilder(existing, {
+        onDone: (savedId) => {
+          close();
+          selectedId = savedId || selectedId;
+          load();
+        },
+        onCancel: close,
+      });
+      body.replaceChildren(builder);
+    } catch (e) {
+      body.replaceChildren(h("div", { class: "empty" }, "构建器加载失败: " + e.message));
+    }
+  }
+
+  function openPluginUpload() {
+    const file = h("input", { type: "file", accept: ".zip",
+      "data-testid": "plugin-upload-file", style: "width:100%" });
+    const error = h("div", { style: "color:var(--bad);min-height:18px;font-size:12px" });
+    const submit = h("button", { class: "btn primary", disabled: true,
+      "data-testid": "plugin-upload-submit" }, "上传并安装");
+    const close = () => overlay.remove();
+    file.addEventListener("change", () => {
+      submit.disabled = !file.files.length;
+      error.textContent = "";
+    });
+    submit.addEventListener("click", async () => {
+      if (!file.files.length) return;
+      submit.disabled = true;
+      submit.textContent = "上传中…";
+      try {
+        const selected = file.files[0];
+        const base64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(String(reader.result).split(",")[1] || "");
+          reader.onerror = () => reject(reader.error || new Error("文件读取失败"));
+          reader.readAsDataURL(selected);
+        });
+        const result = await api.post("weapon_plugins/upload", {
+          filename: selected.name, content_base64: base64,
+        });
+        toast(`插件 ${result.plugin.name} 已安装`);
+        close();
+        await load();
+      } catch (e) {
+        error.textContent = e.message;
+        submit.disabled = false;
+      } finally {
+        submit.textContent = "上传并安装";
+      }
+    });
+    const overlay = h("div", { class: "weapon-editor", role: "dialog", "aria-modal": "true" },
+      h("div", { class: "weapon-editor-mask", onclick: close }),
+      h("div", { class: "weapon-editor-panel small" },
+        h("div", { class: "weapon-editor-head" },
+          h("div", {}, h("h2", {}, "上传武器包"),
+            h("div", { class: "faint" }, "ZIP 校验后安装并热重载"),
+          h("button", { class: "ctl", onclick: close }, "关闭")),
+        h("div", { class: "weapon-editor-body" },
+          h("div", { class: "card pad", style: "display:grid;gap:12px" },
+            h("div", { class: "muted" },
+              "包内需包含 weapon.json 和 weapon.py，也支持同级 templates 目录。ZIP 最大 1 MiB，不覆盖已有包。"),
+            file,
+            h("div", { class: "faint", style: "font-size:11px" },
+              "Python 插件会以控制台进程权限加载，仅上传你信任的来源。"),
+            error,
+            h("div", { style: "display:flex;justify-content:flex-end" }, submit))))));
+    root.append(overlay);
+  }
+
+  const uploadBtn = h("button", { class: "btn", "data-testid": "plugin-upload-button" }, "上传包");
+  uploadBtn.addEventListener("click", openPluginUpload);
+  const reloadBtn = h("button", { class: "btn" }, "重载插件");
+  reloadBtn.addEventListener("click", async () => {
+    reloadBtn.disabled = true;
+    try {
+      const result = await api.post("arsenal", { action: "reload" });
+      const errors = Object.keys(result.errors || {}).length;
+      toast(errors ? `插件已重载，${errors} 个包保留旧版本` : "插件包已重载",
+        errors ? "err" : "ok");
+      await load();
+    } catch (e) { toast(e.message, "err"); }
+    finally { reloadBtn.disabled = false; }
+  });
+  const resetPage = () => { currentPage = 1; renderWorkspace(); };
+  search.addEventListener("input", resetPage);
+  classFilter.addEventListener("change", resetPage);
+  statusFilter.addEventListener("change", resetPage);
+  pageSizeSelect.addEventListener("change", () => {
+    pageSize = Number(pageSizeSelect.value) || 10;
+    resetPage();
+  });
+  prevBtn.addEventListener("click", () => changePage(-1));
+  nextBtn.addEventListener("click", () => changePage(1));
+  root.append(
+    h("div", { class: "toolbar arsenal-page-actions" },
+      h("button", { class: "btn primary", onclick: () => openBuilder(null) }, "＋ 新建武器"),
+      uploadBtn,
+      reloadBtn,
+      h("span", { class: "spacer" }),
+      h("span", { class: "faint" }, "插件化武器运行时")),
+    summaryBox,
+    h("div", { class: "arsenal-filters card" }, search, classFilter, statusFilter, count),
+    h("div", { class: "arsenal-workspace", "data-testid": "arsenal-workspace" },
+      h("aside", { class: "arsenal-list-panel card" },
+        h("div", { class: "arsenal-list-head" }, "武器清单"),
+        listBox,
+        h("div", { class: "arsenal-pagination" },
+          pageSizeSelect,
+          h("span", { class: "spacer" }),
+          prevBtn, pageInfo, nextBtn)),
+      detailBox));
   await load();
   return { root, reload: load };
 }

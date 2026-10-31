@@ -1,0 +1,12 @@
+{
+  "id": "vuln.traversal",
+  "name": "路径穿越与虚拟文件读取",
+  "version": "1.0.0",
+  "api_version": 1,
+  "class": "vuln",
+  "mount": "delivery",
+  "stage": "sensor",
+  "entrypoint": "weapon.py:Plugin",
+  "telemetry": {"expect": ["vuln_mounted", "file_read"]},
+  "world_constraints": ["与 core.fs_world 使用同一文件树", "不存在路径返回 404"]
+}

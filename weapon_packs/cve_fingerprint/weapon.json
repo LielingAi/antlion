@@ -1,0 +1,12 @@
+{
+  "id": "vuln.cve_fingerprint",
+  "name": "通用 CVE 错误与组件指纹",
+  "version": "1.0.0",
+  "api_version": 1,
+  "class": "vuln",
+  "mount": "delivery",
+  "stage": "sensor",
+  "entrypoint": "weapon.py:Plugin",
+  "telemetry": {"expect": ["vuln_mounted"]},
+  "world_constraints": ["组件版本与响应头互证", "内部坐标来自会话世界"]
+}

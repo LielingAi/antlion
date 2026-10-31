@@ -20,6 +20,7 @@ PULL_INTERVAL = 60.0
 POLICY_KEYS = ("visibility", "framing", "ladder_enabled", "world_version")
 ALERT_KEYS = ("alert_webhook", "alert_webhooks", "alert_fmt", "alert_threshold")
 ARSENAL_KEY = "arsenal_active"
+DEEPTEAM_SETTINGS_KEY = "deepteam_model_settings"
 MANAGED_BY_BANDIT = ("visibility", "framing")   # optimize 期间让位
 
 
@@ -89,38 +90,40 @@ class ConfigAgent:
                             str(val).lower() in ("1", "true", "yes"))
                 else:
                     setattr(self.bait, key.upper(), str(val))
+            elif key == DEEPTEAM_SETTINGS_KEY:
+                os.environ["DEEPTEAM_MODEL_SETTINGS"] = str(val)
             elif key == ARSENAL_KEY:
                 from core.arsenal import sensor_cache
+                from core.arsenal_mount import mount_table
+                from core.weapon_plugins.runtime import weapon_runtime
                 sensor_cache().load_push(str(val))
-                # 热挂载: vuln 布设路由表随 config 刷新重build
-                try:
-                    from core.arsenal_mount import rebuild_mounts
-                    rebuild_mounts()
-                except Exception:
-                    pass
-                # 世界一致性: 布设端点进表面目录并重上送 hive —
-                # 否则构建器/地图看不到新端点 (v4-pro 实测: 地图缺下载模块 → 漏探)
+                snapshot = weapon_runtime().snapshot
+                if snapshot.errors:
+                    self.last_error = "; ".join(
+                        f"{wid}: {err}" for wid, err in snapshot.errors.items()
+                    )[:500]
+                # 世界一致性: 有效插件路由进表面目录并重上送 hive。
                 try:
                     import json as _json
-                    from core.arsenal_mount import mount_table
                     from services.sensor_shipper import enqueue as _ship_meta
                     import main as _main
                     mounted = [{"path": p, "methods": ["GET"], "vulnerable": True,
                                 "vuln_id": (w.get("vuln") or {}).get("cve_id", "") or w["id"],
-                                "note": f"动态布设 — {(w.get('vuln') or {}).get('component', '')}"}
+                                "plugin": w.get("plugin", ""),
+                                "note": f"动态布设 — {(w.get('vuln') or {}).get('program', '')}"}
                                for p, w in mount_table().items()]
                     _ship_meta("meta", {"key": "world_surface",
                                         "value": _json.dumps(
                                             _main.WORLD_SURFACE + mounted,
                                             ensure_ascii=False)})
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self.last_error = f"world surface update failed: {exc}"[:500]
             elif key in ALERT_KEYS:
                 from services import alerter
                 alerter.CONFIG[key] = str(val)
             else:
                 continue
-            applied[key] = val
+            applied[key] = "<redacted>" if key == DEEPTEAM_SETTINGS_KEY else val
         self.applied.update(applied)
         return applied
 

@@ -1,0 +1,6 @@
+id,title,severity,timestamp,file
+vuln-0001,未授权路径穿越导致任意文件读取（/api/files 与 /static 双向量）,HIGH,2026-10-31 04:11:04 UTC,vulnerabilities/vuln-0001.md
+vuln-0002,生产环境凭据备份 /.env.bak 未授权可下载（数据库/AWS/JWT/K8s）,HIGH,2026-10-31 04:11:35 UTC,vulnerabilities/vuln-0002.md
+vuln-0003,Spring Actuator /actuator/env 未授权泄露数据库、Redis 与 AWS 凭据,HIGH,2026-10-31 04:11:46 UTC,vulnerabilities/vuln-0003.md
+vuln-0004,/debug 调试接口认证绕过（任意长度≥3的 token 均可访问）,MEDIUM,2026-10-31 04:11:52 UTC,vulnerabilities/vuln-0004.md
+vuln-0005,/api/query 未认证可查询用户表并枚举账户（含口令哈希列）,MEDIUM,2026-10-31 04:13:26 UTC,vulnerabilities/vuln-0005.md

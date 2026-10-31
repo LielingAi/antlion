@@ -1,0 +1,11 @@
+id,title,severity,timestamp,file
+vuln-0001,未授权任意文件读取（路径穿越）在 /api/files 的 path 参数,HIGH,2026-10-31 07:32:53 UTC,vulnerabilities/vuln-0001.md
+vuln-0002,生产环境配置文件 /.env.bak 未授权泄露（凭据与内部拓扑）,MEDIUM,2026-10-31 07:33:11 UTC,vulnerabilities/vuln-0002.md
+vuln-0003,Spring Boot Actuator /actuator/env 未授权暴露明文数据库、缓存与云凭据,MEDIUM,2026-10-31 07:33:25 UTC,vulnerabilities/vuln-0003.md
+vuln-0004,CORS 反射任意 Origin 且允许携带凭据（NEX-4482 回归）,MEDIUM,2026-10-31 07:33:39 UTC,vulnerabilities/vuln-0004.md
+vuln-0005,调试控制台 /debug 的 token 校验可被任意短字符串绕过,MEDIUM,2026-10-31 07:33:52 UTC,vulnerabilities/vuln-0005.md
+vuln-0006,未授权接口 /api/query 直接返回用户账户与口令哈希,MEDIUM,2026-10-31 07:34:10 UTC,vulnerabilities/vuln-0006.md
+vuln-0007,Unauthenticated self-declared identity grants authorization level 1 and exposes production credentials,MEDIUM,2026-10-31 07:47:19 UTC,vulnerabilities/vuln-0007.md
+vuln-0008,"SQL injection in /api/query query parameter (error-, boolean- and time-based)",MEDIUM,2026-10-31 07:48:56 UTC,vulnerabilities/vuln-0008.md
+vuln-0009,未授权静态文件泄露 GitLab 访问令牌与内部配置（/.git/config 与 /static/app.js）,LOW,2026-10-31 07:52:21 UTC,vulnerabilities/vuln-0009.md
+vuln-0010,未授权 Prometheus /metrics 泄露内网数据库/缓存地址、Pod 名称与构建版本,LOW,2026-10-31 07:52:38 UTC,vulnerabilities/vuln-0010.md

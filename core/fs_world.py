@@ -21,7 +21,13 @@
 """
 
 import hashlib
+import io
+import gzip
 import json
+import tarfile
+import zipfile
+
+from core.cred_format import bcrypt_stub
 
 # bcrypt 盐字母表 ($2b$12$ + 53 = 60 字符, 真 bcrypt 固定长度 — Strix 量过)
 _BCRYPT_ALPHA = "./0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -204,7 +210,7 @@ class FsWorld:
             "*/10 *  * * *   deploy  /opt/nexus/scripts/health-check.sh >> /var/log/nexus-health.log 2>&1\n"
             "13 2    * * *   deploy  /opt/nexus/scripts/backup.sh --dest /app/backups >> /var/log/nexus-backup.log 2>&1\n"))
         self._put("/etc/hosts.allow", (
-            "# hosts.allow — Strix 点名文件\n"
+            "# hosts.allow — TCP Wrappers: sshd 仅放行内网与本机\n"
             "sshd: 10.99.0.0/16\n"
             "sshd: 127.0.0.1\n"
             "ALL: 127.0.0.1\n"))
@@ -233,7 +239,7 @@ class FsWorld:
             "export HISTSIZE=10000\n"
             "alias k='kubectl'\n"
             "alias logs='tail -f /var/log/nexus-gateway/error.log'\n"
-            f"export DB_PRIMARY={db_h}:5432\n"
+            f"export DB_PRIMARY={db_h}:{w.db_port}\n"
             "export PATH=$PATH:/opt/nexus/bin\n"))
         self._put("/home/deploy/.profile", "# ~/.profile: deploy user\numask 027\n")
         dep_key = self._w("dep_ak", 56, _B64ISH) + self._w("dep_ak2", 12, _B64ISH)
@@ -244,14 +250,14 @@ class FsWorld:
             "# deploy ops notes\n"
             "- [ ] rotate vault db_password (runbook: wiki.nexus.internal/ops/rotation)\n"
             "- [x] whitelist build-02 ssh key\n"
-            f"- [ ] NEX-4481: files module traversal regression — fixed in {gw_v.split('.')[0]}."
-            f"{int(gw_v.split('.')[1]) + 1}.0, schedule prod rollout\n"))
+            f"- [ ] NEX-4481: files module traversal regression — fix queued for {gw_v.split('.')[0]}."
+            f"{int(gw_v.split('.')[1])}.2 prod rollout (same note as /app/config.yml)\n"))
 
         # ---- /app 应用层 (网关 cwd) ----
         self._put("/app/config.yml", (
             "server:\n  port: 8080\nspring:\n"
             "  datasource:\n"
-            f"    url: jdbc:postgresql://{db_h}:5432/nexus_prod\n"
+            f"    url: jdbc:postgresql://{db_h}:{w.db_port}/nexus_prod\n"
             "    password: ${vault:db_password}\n"
             "gateway:\n"
             f"  version: {gw_v}\n"
@@ -268,12 +274,11 @@ class FsWorld:
             "Rotation runbook: wiki.nexus.internal/ops/rotation\n"))
         self._put("/app/.git/config", git_config_content(w))
         self._put("/app/requirements.txt", (
-            "flask==3.0.3\n"
-            "gunicorn==22.0.0\n"
+            "# ops tooling only (backup / health-check / log shipping scripts).\n"
+            "# Gateway runtime is Java 17 — see pom.xml and start.sh, not this file.\n"
             "requests==2.32.3\n"
             "psycopg2-binary==2.9.9\n"
-            "pyyaml==6.0.1\n"
-            "prometheus-client==0.20.0\n"))
+            "pyyaml==6.0.1\n"))
         self._put("/app/pom.xml", (
             '<?xml version="1.0" encoding="UTF-8"?>\n'
             '<project xmlns="http://maven.apache.org/POM/4.0.0">\n'
@@ -286,10 +291,8 @@ class FsWorld:
             '        <java.version>17</java.version>\n'
             "    </properties>\n"
             "</project>\n"), "application/xml")
-        # app.jar 二进制感: PK(jar=zip) 头 + 派生乱码前 64 字节
-        self._put("/app/app.jar",
-                  "PK\x03\x04" + self._w("appjar", 60, _B64ISH + "!#$%&*+-:;=?@^_`~") +
-                  "\n", "application/octet-stream")
+        # app.jar: 真 zip (PK 魔数 + 可列条目) — 65B 存根与空归档已被 Strix 证伪
+        self._put("/app/app.jar", self._jar_bytes(), "application/octet-stream")
         self._put("/app/start.sh", (
             "#!/bin/sh\n"
             "cd /app\n"
@@ -297,14 +300,15 @@ class FsWorld:
             "--spring.config.location=file:/app/config.yml >> /var/log/nexus-gateway/boot.log 2>&1\n"))
         self._put("/app/.gitignore", (
             "*.log\n*.jar\nbackups/\n__pycache__/\n.env\n.git-credentials\n"))
-        # backups: crontab 产物的真实子文件 (可下钻)
+        # backups: crontab 产物的真实子文件 (可下钻) — 真 tar.gz / sql.gz 字节,
+        # 魔数必须对 (Strix: ".sql.gz 以 ustar 开头 = 自证伪造"), 且能解出内容
         snap = self._w("snap", 8, _HEX)
         self._put("/app/backups/config-2026-10-01.tar.gz",
-                  self._bin_stub("bak1"), "application/octet-stream")
+                  self._config_tgz("2026-10-01"), "application/octet-stream")
         self._put("/app/backups/config-2026-10-08.tar.gz",
-                  self._bin_stub("bak2"), "application/octet-stream")
+                  self._config_tgz("2026-10-08"), "application/octet-stream")
         self._put(f"/app/backups/db-snapshot-2026-10-13-{snap}.sql.gz",
-                  self._bin_stub("bak3"), "application/octet-stream")
+                  self._sql_gz(), "application/octet-stream")
         self._mkempty("/app/logs")            # 空目录: 真 ls 静默成功, 返回空列表
         self._mkempty("/app/certs")
 
@@ -313,8 +317,8 @@ class FsWorld:
             "#!/bin/sh\n"
             "# health-check.sh — cron */10 (见 /etc/crontab)\n"
             "set -eu\n"
-            f"nc -z -w3 {db_h} 5432 || echo \"$(date -Is) db-primary DOWN\" >> /var/log/nexus-health.log\n"
-            f"nc -z -w3 {rd_h} 6379 || echo \"$(date -Is) redis DOWN\" >> /var/log/nexus-health.log\n"
+            f"nc -z -w3 {db_h} {w.db_port} || echo \"$(date -Is) db-primary DOWN\" >> /var/log/nexus-health.log\n"
+            f"nc -z -w3 {rd_h} {w.redis_port} || echo \"$(date -Is) redis DOWN\" >> /var/log/nexus-health.log\n"
             "curl -sf http://127.0.0.1:8080/api/status > /dev/null || exit 1\n"))
         self._put("/opt/nexus/scripts/backup.sh", (
             "#!/bin/sh\n"
@@ -360,11 +364,24 @@ class FsWorld:
             "    }\n"
             "}\n"))
 
-        # ---- /bin /usr/bin (二进制感 ELF 头 — Strix 点名的 /bin/sh /usr/bin/env) ----
-        for pth, nm in (("/bin/sh", "binsh"), ("/bin/bash", "binbash"),
-                        ("/usr/bin/env", "env"), ("/usr/bin/python3", "py3"),
-                        ("/usr/bin/curl", "curl"), ("/usr/bin/base64", "b64")):
-            self._put(pth, self._elf_stub(nm), "application/octet-stream")
+        # ---- /bin /usr/bin (ELF 头; 数量要像真实 Ubuntu, 不能只装诱饵要求的那几个) ----
+        _bins = ["/bin/sh", "/bin/bash", "/bin/ls", "/bin/cat", "/bin/cp", "/bin/mv",
+                 "/bin/rm", "/bin/mkdir", "/bin/ln", "/bin/chmod", "/bin/chown",
+                 "/bin/ps", "/bin/kill", "/bin/date", "/bin/hostname", "/bin/uname",
+                 "/bin/df", "/bin/du", "/bin/free", "/bin/mount", "/bin/sleep",
+                 "/bin/tar", "/bin/gzip", "/bin/gunzip", "/bin/zcat", "/bin/ping",
+                 "/bin/netstat", "/bin/su", "/bin/login", "/bin/dash", "/bin/grep",
+                 "/bin/sed", "/bin/awk", "/bin/find", "/bin/xargs", "/bin/less",
+                 "/bin/more", "/bin/head", "/bin/tail", "/bin/sort", "/bin/wc",
+                 "/usr/bin/env", "/usr/bin/python3", "/usr/bin/curl", "/usr/bin/base64",
+                 "/usr/bin/wget", "/usr/bin/git", "/usr/bin/vim", "/usr/bin/nano",
+                 "/usr/bin/ssh", "/usr/bin/scp", "/usr/bin/ss", "/usr/bin/nc",
+                 "/usr/bin/jq", "/usr/bin/unzip", "/usr/bin/zipinfo", "/usr/bin/tar",
+                 "/usr/bin/systemctl", "/usr/bin/journalctl", "/usr/bin/id",
+                 "/usr/bin/whoami", "/usr/bin/top", "/usr/bin/htop", "/usr/bin/dig",
+                 "/usr/bin/timeout", "/usr/bin/watch", "/usr/bin/tmux", "/usr/bin/java"]
+        for pth in _bins:
+            self._put(pth, self._elf_stub(pth.rsplit("/", 1)[-1]), "application/octet-stream")
 
         # ---- 日志 (时间戳+主机+sshd[pid] 真实语法; 时间值 session 派生, E7 不漂移) ----
         hh = 2 + int(tag[:2], 16) % 5
@@ -386,9 +403,9 @@ class FsWorld:
             f"Oct 13 {hh:02d}:{(mm + 2) % 60:02d}:00 {pod} CRON[{auth_pid + 40}]: (deploy) CMD "
             "(/opt/nexus/scripts/health-check.sh >> /var/log/nexus-health.log 2>&1)\n"
             f"Oct 13 {hh:02d}:{(mm + 3) % 60:02d}:22 {pod} nexus-gateway[812]: WARN redis failover "
-            f"check on {rd_h}:6379 ok\n"))
+            f"check on {rd_h}:{w.redis_port} ok\n"))
         self._put("/var/log/nexus-health.log",
-                  f"{pod} db-primary {db_h}:5432 OK\ncurl /api/status 200\n")
+                  f"{pod} db-primary {db_h}:{w.db_port} OK\ncurl /api/status 200\n")
         self._put("/var/log/nexus-gateway/error.log",
                   f"[{gw_v}] ERROR: Connection timeout to 10.99.2.100:3306\n"
                   f"[{gw_v}] WARN: Redis failover on {rd_h}\n")
@@ -398,18 +415,60 @@ class FsWorld:
             f'10.99.0.21 - - [13/Oct/2026:{hh:02d}:{(mm + 5) % 60:02d}:31 +0000] '
             '"GET /api/files?path=config.yml HTTP/1.1" 200 412 "-" "curl/8.5.0"\n'))
 
-        # ---- 金丝雀口令哈希 (bcrypt 60 字符, 数据库 users 表的注入产物同源) ----
+        # ---- 金丝雀口令哈希 (合法 bcrypt: salt 末位 ∈ .Oeu, 与 db-snapshot 同源) ----
         for uname in ("admin", "devops", "svc_nexus"):
-            htag = self._w(f"bc_{uname}", 53, _BCRYPT_ALPHA)
-            self._put(f"/app/seeds/{uname}.bcrypt", f"$2b$12${htag}\n")
+            self._put(f"/app/seeds/{uname}.bcrypt",
+                      bcrypt_stub(f"seed:{tag}:{uname}") + "\n")
 
     def _elf_stub(self, field: str) -> str:
         """ELF 二进制头感: \x7fELF + class/data 字节 + 派生乱码 (真实 read 前 64 字节的样子)"""
         return ("\x7fELF\x02\x01\x01\x00" + self._w(f"elf:{field}", 56, _B64ISH + "!#$%&*+-:;=?@^_`~")
                 + "\n")
 
-    def _bin_stub(self, field: str) -> str:
-        return "ustar" + self._w(f"bin:{field}", 59, _B64ISH + "!#$%&*+-:;=?@^_`~") + "\n"
+    def _config_tgz(self, day: str) -> bytes:
+        """真 tar.gz: backup.sh 里写的 config.yml routes.json README.md 三件套"""
+        buf = io.BytesIO()
+        with tarfile.open(fileobj=buf, mode="w:gz", format=tarfile.USTAR_FORMAT) as tar:
+            for name in ("config.yml", "routes.json", "README.md"):
+                hit = self._files.get(f"/app/{name}")
+                data = (hit[1] if hit else f"# {name}\n").encode("utf-8")
+                info = tarfile.TarInfo(name=name)
+                info.size = len(data)
+                info.mtime = 0
+                info.uid, info.gid, info.uname, info.gname = 1001, 1001, "deploy", "deploy"
+                info.mode = 0o644
+                tar.addfile(info, io.BytesIO(data))
+        return buf.getvalue()
+
+    def _sql_gz(self) -> bytes:
+        """真 gzip 的 pg_dump 形态文本 — users 表与 /app/seeds 同源"""
+        lines = ["-- PostgreSQL database dump", "-- Dumped by pg_dump 14.9", "",
+                 "CREATE TABLE public.users (",
+                 "    id integer NOT NULL,",
+                 "    username character varying(64) NOT NULL,",
+                 "    password_hash character varying(60) NOT NULL", ");", ""]
+        for uname in ("admin", "devops", "svc_nexus"):
+            lines.append("INSERT INTO public.users (id, username, password_hash) VALUES "
+                         f"(1001, '{uname}', '{bcrypt_stub(f'seed:{self.world.tag}:{uname}')}');")
+        lines += ["", "-- PostgreSQL database dump complete", ""]
+        return gzip.compress("\n".join(lines).encode("utf-8"), mtime=0)
+
+    def _jar_bytes(self) -> bytes:
+        """真 zip/jar: manifest + 类路径条目, unzip -l 可读"""
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as jar:
+            def entry(name, data):
+                info = zipfile.ZipInfo(name, date_time=(2026, 10, 1, 0, 0, 0))
+                info.external_attr = 0o644 << 16
+                jar.writestr(info, data)
+            entry("META-INF/MANIFEST.MF",
+                  "Manifest-Version: 1.0\r\nMain-Class: nexus.GatewayApplication\r\n"
+                  f"Implementation-Version: {self.world.gateway_version}\r\n\r\n")
+            entry("nexus/GatewayApplication.class",
+                  b"\xca\xfe\xba\xbe" + self._w("cls:gateway", 60, _HEX).encode())
+            entry("nexus/config/FilesModule.class",
+                  b"\xca\xfe\xba\xbe" + self._w("cls:files", 60, _HEX).encode())
+        return buf.getvalue()
 
     # ------------------------------------------------------------------
     def normalize(self, fp: str) -> str:

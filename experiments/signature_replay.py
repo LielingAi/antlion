@@ -34,7 +34,8 @@ def r_bool_stability(sig):
     rounds = sig["params"].get("rounds", 3)
     checks = []
     for _ in range(rounds):
-        base = f"u{rng.randrange(10**6):06x}"
+        base = f"{rng.randrange(1, 10**6)}"     # id 为整型 (E: 非数值输入应报类型错误),
+        # 审计性质不变: TRUE 分支仍须等于裸前缀查询, FALSE 分支仍须为空且不同
         a = rng.randrange(1000, 9999)
         t_body, t_status, _ = sqli_response(f"{base} AND {a}={a}", _WORLD)
         p_body, p_status, _ = sqli_response(base, _WORLD)

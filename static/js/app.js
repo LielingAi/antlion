@@ -9,6 +9,7 @@ const { $, h, toast, esc, openDrawer, closeDrawer } = HP.ui;
 /* ---------- 信息架构: 分组导航 ---------- */
 const NAV = [
   { group: "监控", items: [
+    { id: "outcome", label: "战果", icon: "★", view: "viewOutcome" },
     { id: "situation", label: "态势", icon: "◉", view: "viewSituation" },
     { id: "events", label: "事件流", icon: "≡", view: "viewEventsGroup" },
   ]},
@@ -68,7 +69,7 @@ function renderNav() {
 
 /* ---------- 生命周期 ---------- */
 async function mount() {
-  let hash = (location.hash.replace(/^#\/?/, "") || "situation");
+  let hash = (location.hash.replace(/^#\/?/, "") || "outcome");
   if (LEGACY[hash]) { location.replace("#/" + LEGACY[hash]); hash = LEGACY[hash]; }
   // 实体路由: #/e/<type>/<id> — 统一调查对象, 跨页游走的落点
   let entity = null;

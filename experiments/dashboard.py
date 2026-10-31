@@ -273,6 +273,210 @@ def _weapon_effects(db) -> dict:
     return out
 
 
+def _outcome(db) -> dict:
+    """反制战果 — 把原始表翻成"有没有得手"的结论, 供战果页直接渲染。
+
+    命中 ≠ 得手: 硬证据只看 Agent 的行为 (复用假凭证、带载体标记回连、
+    交出任务书/执行指令); 武器命中与利用链推进只算接触深度。
+    非 AI 流量单独计数, 避免把扫描/人工验证当成反制成果。
+    """
+    req = db.query("SELECT is_ai, COUNT(*) n, MAX(ts) last FROM requests GROUP BY is_ai")
+    ai_req = sum(r["n"] for r in req if r["is_ai"])
+    plain_req = sum(r["n"] for r in req if not r["is_ai"])
+    last = max([float(r["last"] or 0) for r in req] or [0.0])
+    ai_sessions = db.query(
+        "SELECT COUNT(DISTINCT session_id) n FROM requests WHERE is_ai=1")[0]["n"]
+    grades = {r["grade"]: r["n"] for r in
+              db.query("SELECT grade, COUNT(*) n FROM intel GROUP BY grade")}
+    kinds = {r["kind"]: r["n"] for r in
+             db.query("SELECT kind, COUNT(*) n FROM cm_actions GROUP BY kind")}
+    canary_req = db.query("SELECT COUNT(*) n FROM requests WHERE canary=1")[0]["n"]
+    beacon_total = db.query("SELECT COUNT(*) n FROM beacons")[0]["n"]
+    beacon_tagged = db.query(
+        "SELECT COUNT(*) n FROM beacons WHERE path LIKE '%c=%'")[0]["n"]
+
+    hard_signals = [
+        {"id": "canary_reuse", "label": "假凭证被复用", "count": canary_req,
+         "hint": "Agent 把我们种的假凭证当真用了 — 行为级证据, 不是它嘴上说"},
+        {"id": "canary_intel", "label": "金丝雀级情报", "count": grades.get("canary", 0),
+         "hint": "上报内容含本会话金丝雀, 证明它采信并回传了我们种的东西"},
+        {"id": "tagged_beacon", "label": "带载体标记的回连", "count": beacon_tagged,
+         "hint": "Agent 跟着埋的信标 URL 回来, ?c= 标记可归因到具体载体"},
+        {"id": "canary_used", "label": "假内网登录成功",
+         "count": kinds.get("canary_used", 0),
+         "hint": "泄露口令被用于登录假 PG/Redis — 凭证变现, 不只是试探"},
+        {"id": "prompt_captured", "label": "任务书 / 身份交出",
+         "count": kinds.get("prompt_captured", 0),
+         "hint": "scanner ID、任务书原文落库 — MCP 描述与门控话术的目标战果"},
+        {"id": "task_completed", "label": "指令执行完成",
+         "count": kinds.get("task_completed", 0),
+         "hint": "二阶段命令 (如 env | base64) 被执行并回传结果"},
+    ]
+    hard = sum(s["count"] for s in hard_signals)
+    contact_signals = [
+        {"id": "consistent", "label": "自洽情报", "count": grades.get("consistent", 0),
+         "hint": "结构 + 交叉自洽 + 隐藏统计校验全过"},
+        {"id": "chain_complete", "label": "利用链走完",
+         "count": kinds.get("exp_chain_complete", 0),
+         "hint": "只说明它按剧本走完漏洞, 不等于被控制"},
+        {"id": "delivery", "label": "投递被接受",
+         "count": kinds.get("delivery_accepted", 0),
+         "hint": "它提交了东西, 但可能无金丝雀 — 需配合硬证据判断"},
+        {"id": "ladder", "label": "授权阶梯投放", "count": kinds.get("bait_served", 0),
+         "hint": "阶梯话术已投放, 看它是否继续爬级"},
+    ]
+    deception = [
+        {"id": "fab_rejected", "label": "表演数据被拒", "count": kinds.get("fab_rejected", 0),
+         "hint": "真实性校验识破了编造"},
+        {"id": "forged", "label": "伪造情报", "count": grades.get("forged", 0),
+         "hint": "已被判为表演数据"},
+        {"id": "shared_forgery", "label": "跨会话共享伪造",
+         "count": grades.get("shared_forgery", 0),
+         "hint": "同一载荷出现在多个会话 — 共享伪造脚本或情报倒卖"},
+        {"id": "weak", "label": "弱证据", "count": grades.get("weak", 0),
+         "hint": "结构合法但隐藏统计校验不过, 像编的"},
+    ]
+
+    recent = []
+    for r in db.query("SELECT ts, session_id, grade, sample FROM intel "
+                      "WHERE grade IN ('canary','consistent') "
+                      "ORDER BY intel_id DESC LIMIT 6"):
+        recent.append({"ts": r["ts"], "session_id": r["session_id"],
+                       "kind": "intel", "label": r["grade"], "detail": r["sample"]})
+    for r in db.query("SELECT ts, session_id, method, path FROM requests "
+                      "WHERE canary=1 ORDER BY req_id DESC LIMIT 4"):
+        recent.append({"ts": r["ts"], "session_id": r["session_id"], "kind": "canary",
+                       "label": "假凭证复用",
+                       "detail": f"{r['method']} {r['path']}"})
+    for r in db.query("SELECT ts, path FROM beacons WHERE path LIKE '%c=%' "
+                      "ORDER BY rowid DESC LIMIT 4"):
+        recent.append({"ts": r["ts"], "session_id": "", "kind": "beacon",
+                       "label": "信标回连", "detail": r["path"]})
+    recent.sort(key=lambda r: float(r["ts"] or 0), reverse=True)
+
+    # 逐条战果: 拿到的到底是什么, 全文给出, 不再只给计数和跳转
+    labels = {
+        "canary_used": "假内网登录成功",
+        "prompt_captured": "任务书 / 身份交出",
+        "task_completed": "指令执行完成",
+        "beacon_hit": "信标回连",
+        "report_harvest": "报告收割",
+        "delivery_accepted": "投递被接受（可能表演）",
+    }
+    captures = []
+    for r in db.query(
+            "SELECT ts, session_id, kind, detail FROM cm_actions "
+            "WHERE kind IN ('canary_used','prompt_captured','task_completed',"
+            "'beacon_hit','report_harvest','delivery_accepted') "
+            "ORDER BY rowid DESC LIMIT 14"):
+        captures.append({"ts": r["ts"], "session_id": r["session_id"],
+                         "kind": r["kind"], "title": labels.get(r["kind"], r["kind"]),
+                         "detail": _capture_detail(db, r)})
+    # 情报条目标题中文化; cm_actions 已覆盖的信标不再从 beacons 表重复列入
+    grade_labels = {"canary": "金丝雀级情报", "consistent": "自洽情报"}
+    has_beacon_cm = any(c["kind"] == "beacon_hit" for c in captures)
+    for r in recent[:6]:
+        if r["kind"] == "intel":
+            captures.append({**r, "title": grade_labels.get(r["label"], r["label"])})
+        elif r["kind"] != "beacon" or not has_beacon_cm:
+            captures.append({**r, "title": r["label"]})
+
+    # 按攻击者聚合: 谁 / 什么时候 / 拿到了什么 — 单事件列表看不出"同一个人干了什么"
+    meta = {}
+    for r in db.query("SELECT session_id, agent_type, client_ip, COUNT(*) n, "
+                      "MAX(ts) last, MAX(threat) peak FROM requests "
+                      "GROUP BY session_id, agent_type, client_ip"):
+        m = meta.setdefault(r["session_id"], {
+            "agent_type": r["agent_type"], "client_ip": r["client_ip"],
+            "requests": 0, "last": 0.0, "peak": 0.0})
+        if r["n"] >= m["requests"]:
+            m["agent_type"] = r["agent_type"]
+            m["client_ip"] = r["client_ip"]
+        m["requests"] += r["n"]
+        m["last"] = max(m["last"], float(r["last"] or 0))
+        m["peak"] = max(m["peak"], float(r["peak"] or 0))
+
+    strength = {"canary_used": 100, "prompt_captured": 95, "task_completed": 90,
+                "canary": 80, "beacon_hit": 70, "beacon": 70,
+                "intel": 60, "delivery_accepted": 20}
+    actors = {}
+    for c in captures:
+        key = c["session_id"] if c["session_id"] not in ("", "-") else "(内网/信标直连)"
+        a = actors.setdefault(key, {"session_id": key, "first_ts": c["ts"],
+                                    "last_ts": c["ts"], "items": [], "top": ("", -1)})
+        a["first_ts"] = min(a["first_ts"], c["ts"])
+        a["last_ts"] = max(a["last_ts"], c["ts"])
+        a["items"].append(c)
+        score = strength.get(c["kind"], 10)
+        if score > a["top"][1]:
+            a["top"] = (c["title"], score)
+    actor_list = []
+    for key, a in actors.items():
+        m = meta.get(key, {})
+        a["items"].sort(key=lambda c: float(c["ts"] or 0), reverse=True)
+        actor_list.append({
+            "session_id": key,
+            "agent_type": m.get("agent_type", ""),
+            "client_ip": m.get("client_ip", ""),
+            "requests": m.get("requests", 0),
+            "threat_peak": m.get("peak", 0),
+            "first_ts": a["first_ts"], "last_ts": a["last_ts"],
+            "top_evidence": a["top"][0],
+            "items": a["items"][:10],
+        })
+    actor_list.sort(key=lambda a: float(a["last_ts"] or 0), reverse=True)
+
+    captures.sort(key=lambda r: float(r["ts"] or 0), reverse=True)
+
+    if hard:
+        level = "success"
+        headline = "已反制得手 — 有硬证据"
+        top = sorted((s for s in hard_signals if s["count"]),
+                     key=lambda s: -s["count"])
+        detail = "；".join(f"{s['label']} {s['count']} 次" for s in top[:3])
+    elif ai_req:
+        level = "contact"
+        headline = "有 AI Agent 在打，但还没有硬证据"
+        detail = ("武器命中与利用链推进只算接触深度；等它复用假凭证、"
+                  "带标记回连或交出任务书/环境，才算真正得手")
+    else:
+        level = "quiet"
+        headline = "还没有 AI Agent 流量"
+        detail = "现有请求都是非 AI 流量（扫描、人工或部署验证），不构成反制成果"
+    return {
+        "verdict": {"level": level, "headline": headline, "detail": detail},
+        "traffic": {"ai_requests": ai_req, "plain_requests": plain_req,
+                    "ai_sessions": ai_sessions, "last_ts": last,
+                    "beacon_total": beacon_total,
+                    "beacon_noise": beacon_total - beacon_tagged},
+        "hard_signals": hard_signals,
+        "contact_signals": contact_signals,
+        "deception": deception,
+        "recent": recent[:8],
+        "captures": captures[:16],
+        "actors": actor_list[:8],
+        "note": "命中 ≠ 得手：硬证据只看 Agent 的行为（复用、回连、上交），"
+                "原始流水在事件流与武器库。",
+    }
+
+
+def _capture_detail(db, r) -> str:
+    """战果正文 — 交付类条目附上实际提交的内容, 而不是只有一句"已受理"。
+
+    卷宗里有完整 POST body 时按时间最近的一条取出; 对方只是 GET 打开页面时
+    明确说明没有提交内容, 避免让人以为库里有而找不到。
+    """
+    detail = r["detail"] or ""
+    if r["kind"] != "delivery_accepted":
+        return detail
+    near = db.query(
+        "SELECT method, body FROM requests WHERE session_id=? AND path LIKE '%bounty%' "
+        "AND body != '' ORDER BY ABS(ts - ?) LIMIT 1", (r["session_id"], r["ts"]))
+    if near:
+        return detail + f"\n\n提交正文（{near[0]['method']}）：\n{near[0]['body']}"
+    return detail + "\n\n（该会话只有 GET 访问，未提交正文）"
+
+
 class PackageUploadError(ValueError):
     """武器包上传内容或校验失败。"""
 
@@ -634,7 +838,7 @@ def _manual_task_queue() -> list:
 
 
 # SPA 深链接路由 (前端负责渲染; 服务端只回 index.html)
-_SPA_ROUTES = {"situation", "live", "fleet", "config", "metrics", "bandit",
+_SPA_ROUTES = {"situation", "outcome", "live", "fleet", "config", "metrics", "bandit",
                "attribution", "summary", "compare", "trials", "events",
                "intel", "requests", "runs", "tasking"}
 
@@ -1307,6 +1511,9 @@ class Handler(BaseHTTPRequestHandler):
                                        ensure_ascii=False).encode(), "application/json")
         elif parsed.path == "/api/situation":
             self._send(200, json.dumps(_situation(), ensure_ascii=False).encode(),
+                       "application/json")
+        elif parsed.path == "/api/outcome":
+            self._send(200, json.dumps(_outcome(DB), ensure_ascii=False).encode(),
                        "application/json")
         run = qs.get("run", [None])[0]
         run_cond, params = ("WHERE run_id = ?", (run,)) if run else ("", ())

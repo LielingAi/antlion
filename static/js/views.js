@@ -2569,7 +2569,87 @@ async function viewSessions(ctx) {
 
 
 
-HP.views = { viewSituation, viewLive, viewFleet, viewConfig, viewMetrics,
+/* ---------- 反制战果 (结论先行: 有没有得手, 硬证据与噪声分开) ---------- */
+async function viewOutcome(ctx) {
+  const root = h("div", {});
+  root.append(pageHead("反制战果", "有没有得手 — 结论、硬证据与噪声分开"));
+  const box = h("div", {});
+  root.append(box);
+
+  const sigTable = (rows, empty) => table([
+    { h: "信号", k: "label" },
+    { h: "次数", k: "count", num: true },
+    { h: "这意味着什么", render: (r) => h("span", { class: "faint" }, r.hint) },
+  ], rows, { empty });
+  const card = (title, body, link) => h("div", { class: "card" },
+    h("div", { class: "card-head" }, h("span", {}, title),
+      link ? h("a", { href: link, style: "margin-left:auto;font-size:11.5px" }, "原始数据 →") : null),
+    h("div", { class: "card-body" }, body));
+
+  async function load() {
+    const d = await api.get("outcome");
+    const v = d.verdict;
+    const tone = v.level === "success" ? "ok" : v.level === "contact" ? "warn" : "dim";
+    const hardTotal = d.hard_signals.reduce((a, s) => a + s.count, 0);
+    const banner = h("div", { class: `card pad ${tone}`, style: "margin-bottom:12px" },
+      h("div", { style: "display:flex;align-items:center;gap:10px;flex-wrap:wrap" },
+        h("div", { style: "font-size:17px;font-weight:600" }, v.headline),
+        pill(v.level === "success" ? "得手" : v.level === "contact" ? "接触中" : "静默", tone)),
+      h("div", { class: "d", style: "margin-top:6px" }, v.detail),
+      h("div", { class: "d", style: "margin-top:6px" }, d.note));
+    const kpis = h("div", { class: "grid kpi" },
+      statCard({ title: "AI Agent 请求", value: fmtNum(d.traffic.ai_requests),
+        desc: `${d.traffic.ai_sessions} 个 AI 会话 · 最近 ${relTime(d.traffic.last_ts)}` }),
+      statCard({ title: "硬证据", value: fmtNum(hardTotal),
+        desc: "复用 / 回连 / 上交", kind: hardTotal ? "ok" : "" }),
+      statCard({ title: "非 AI 流量", value: fmtNum(d.traffic.plain_requests),
+        desc: "扫描、人工或部署验证 — 不算战果" }),
+      statCard({ title: "信标回连", value: fmtNum(d.traffic.beacon_total),
+        desc: `带载体标记 ${d.traffic.beacon_total - d.traffic.beacon_noise}`
+          + ` · 探测噪声 ${d.traffic.beacon_noise}` }));
+    const capRow = (c) =>
+      h("div", { class: "threat-item", style: "cursor:pointer",
+        onclick: () => openDrawer(c.title || c.label, h("div", {},
+          kvList([["时间", relTime(c.ts)], ["类型", c.title || c.label],
+            ["会话", c.session_id || "-"]]),
+          h("div", { class: "t muted", style: "margin-top:8px" }, "完整内容"),
+          h("pre", { style: "white-space:pre-wrap;word-break:break-all" },
+            c.detail || "（无正文）"))) },
+        h("span", { class: "time" }, relTime(c.ts)),
+        c.kind === "intel" ? gradePill(c.label)
+          : pill(c.title || c.label, c.kind === "canary_used" ? "ok" : "dim"),
+        h("span", { class: "path", style: "white-space:normal" },
+          String(c.detail || c.title || "").slice(0, 160)));
+    const actorCards = (d.actors || []).map((a) =>
+      h("div", { class: "card", style: "margin-top:12px" },
+        h("div", { class: "card-head", style: "flex-wrap:wrap;gap:6px" },
+          entChip("session", a.session_id),
+          a.agent_type ? pill(a.agent_type, "dim") : null,
+          a.top_evidence ? pill("最强: " + a.top_evidence, "ok") : null,
+          h("span", { class: "faint", style: "margin-left:auto;font-size:11.5px" },
+            `${a.requests} 请求 · 最近 ${relTime(a.last_ts)}`)),
+        h("div", { class: "card-body" },
+          h("div", { class: "faint", style: "margin-bottom:6px" },
+            `来源 ${a.client_ip || "-"} · 首次 ${relTime(a.first_ts)}`
+            + ` → 最近 ${relTime(a.last_ts)} · 威胁峰值 ${Math.round(a.threat_peak || 0)}`),
+          a.items.map(capRow))));
+    const capSection = h("div", {},
+      h("div", { class: "t muted", style: "margin:14px 0 4px" },
+        "按攻击者看战果 — 谁、什么时候、拿到了什么（点证据看全文）"),
+      actorCards.length ? actorCards : h("div", { class: "card" },
+        h("div", { class: "card-body" }, h("div", { class: "empty" },
+          "还没有逐条战果。出现假内网登录、信标回连、任务书交出、指令完成时会列在这里。"))));
+    box.replaceChildren(banner, kpis, capSection,
+      h("div", { class: "grid c3", style: "margin-top:12px" },
+        card("硬证据 — 这些才算反制成功", sigTable(d.hard_signals, "暂无")),
+        card("接触深度 — 有动作，但不等于得手", sigTable(d.contact_signals, "暂无")),
+        card("它在演你 — 伪造与表演数据", sigTable(d.deception, "暂无"))));
+  }
+  await load();
+  return { root, reload: load };
+}
+
+HP.views = { viewSituation, viewOutcome, viewLive, viewFleet, viewConfig, viewMetrics,
              viewBandit, viewAttribution, viewSummary, viewCompare, viewTrials,
              viewEvents, viewIntel, viewRequests, viewRuns, viewEntity, viewOps,
              viewArsenal, viewAttackers, viewSessions, viewTasking,

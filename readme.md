@@ -46,6 +46,19 @@ export ADMIN_PASSWORD=<强密码>
 docker compose up -d
 ```
 
+也可写进 `.env`（已被 .gitignore 忽略），`docker compose` 会自动读取。宿主端口用 `SENSOR_PORT` / `HIVE_PORT` 覆盖（默认 8080 / 18899）；hive 只绑 `127.0.0.1`，控制台不出本机。要用 DeepTeam 武器工艺桥接（`deepteam.bridge` 插件）就加 `INSTALL_DEEPTEAM=1` 重新构建；装了 deepteam 的镜像约 560MB。
+
+**跨机部署必须声明对外回连地址**，否则门控话术和 MCP 工具描述里的注册地址会渲染成 `127.0.0.1:8080`——那是攻击者自己（或宿主机上无关的服务），Agent 照做也回不来：
+
+```bash
+HONEYPOT_PUBLIC_BASE=http://<宿主机IP>:8080      # 蜜罐对外基址 (渲染进页面/描述)
+HONEYPOT_BEACON_BASE=http://<宿主机IP>:9999/beacon
+```
+
+四个宿主端口：蜜罐 `SENSOR_PORT`、信标 `BEACON_PORT`(9999，不发布则 cli 二阶段收不到回连)、SDK 采集口 `SDK_PORT`(8898)、控制台 `HIVE_PORT`(仅回环)。`sdk-ingress` 是 telemetry.js 载体的 collector，只转发六个白名单路径（脚本、demo 页、`/api/sdk/*`、`/api/telemetry/*`），管理面不经此口；demo 页 `http://<宿主机IP>:8898/static/demo_sdk.html`。MCP 描述武器的模板支持 `{BASE_URL}` / `{BEACON_URL}` 占位符，武器记录不用绑定部署地址。
+
+**世界一致性与假内网下游**：`HONEYPOT_WORLD_SCOPE=client` 让同一攻击者的所有工具/子代理看到同一个世界（按会话派生会让凭据在请求间漂移，一眼假）。再开 `HONEYPOT_FAKE_INTERNAL=1` + `HONEYPOT_INTERNAL_HOST=<宿主机IP>`，世界里的 PG/Redis 坐标会指向真实监听的假服务（宿主 `15432`/`16379`），泄露的口令可以真的登录——只有蜜罐发出去的假凭证能进，登录成功记 `canary_used` 并出现在「战果」页。
+
 ## 实战战果（全部实录可查）
 
 **指挥通道让 Agent 交出宿主机环境**
@@ -58,6 +71,8 @@ docker compose up -d
 > 嵌入业务页的 telemetry.js 往页面里注假凭证和假内网坐标。v4-pro 评估完，报告里原样引用 6 条诱饵（`DB_HOST=10.99.1.50`、`DEPLOY_TOKEN`...）——它带着我们的剧本回家。
 
 ## 界面
+
+控制台落地页是「战果」：直接回答"有没有反制成功"——硬证据（假凭证复用 / 金丝雀情报 / 带载体标记回连 / 任务书交出 / 指令完成）与接触深度、伪造数据、非 AI 噪声分开展示，数据来自 `/api/outcome`。命中不等于得手，原始流水仍在事件流与武器库。
 
 | 武器库（每把武器：知识档案 + 投送状态 + 实战命中） | 会话卷宗（一个攻击者的完整故事） |
 |---|---|

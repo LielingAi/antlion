@@ -34,6 +34,9 @@ htmlcov/
 # === 本地 AI 工具配置（勿提交） ===
 .claude/
 
+# === 部署密钥（本地 .env，勿提交） ===
+.env
+
 # === 系统 / 驱动日志（非项目内容） ===
 NVIDIA Corporation/
 logs/

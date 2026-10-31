@@ -23,6 +23,8 @@ import struct
 import socket
 import threading
 
+from core.cred_format import bcrypt_stub
+
 PG_VERSION = "PostgreSQL 14.9 (Ubuntu 14.9-0ubuntu0.22.04.1) on x86_64-pc-linux-gnu"
 
 
@@ -96,7 +98,8 @@ def _world_rows(world, n: int = 8):
         d = hashlib.sha256(base + bytes([i])).digest()
         # username 按序取 — 保证 8 个账号每会话齐全 (agent 查 admin 必有回响)
         rows.append((1000 + d[1] * 256 + d[2], users[i % len(users)],
-                     f"$2b$12${d[5:17].hex()}", f"{users[i % len(users)]}@nexus.internal"))
+                     bcrypt_stub(f"{world.session_id}:pg:users:{i}"),
+                     f"{users[i % len(users)]}@nexus.internal"))
     return rows
 
 
@@ -397,8 +400,9 @@ class FakePostgresServer:
 class MiniRedis:
     """迷你 RESP — PING/AUTH/GET/SET 像真 Redis 一样应答"""
 
-    def __init__(self, host: str, port: int = 6379):
+    def __init__(self, host: str, port: int = 6379, auth_resolver=None):
         self.host, self.port = host, port
+        self.auth_resolver = auth_resolver
         self._sock = None
 
     def start(self):
@@ -430,6 +434,11 @@ class MiniRedis:
                     if cmd == "PING":
                         conn.sendall(b"+PONG\r\n")
                     elif cmd.startswith("AUTH"):
+                        if self.auth_resolver is not None:
+                            secret = line.decode(errors="ignore").split()[-1]
+                            if not self.auth_resolver(secret):
+                                conn.sendall(b"-WRONGPASS invalid username-password pair\r\n")
+                                continue
                         conn.sendall(b"+OK\r\n")
                     elif cmd.startswith("GET"):
                         conn.sendall(b"$-1\r\n")

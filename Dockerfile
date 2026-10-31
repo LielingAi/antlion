@@ -13,9 +13,10 @@ COPY . .
 ENV PYTHONUNBUFFERED=1 \
     PYTHONIOENCODING=utf-8
 
-# 传感器形态 (main.py --server): HTTP 蜜罐 8080 (+C2 9999)
-# hive 形态 (experiments/dashboard.py): 控制台 8899
+# 传感器形态 (main.py --server): HTTP 蜜罐 8080 + 信标/C2 9999
+# hive 形态 (experiments/dashboard.py): 控制台 8899 (compose 只绑回环)
+# sdk-ingress 形态 (services/sdk_ingress.py): telemetry.js 采集入口 8898
 # 假 PostgreSQL/Redis 仅实验形态 (experiments/real_runner 内嵌) 提供, 生产容器不起
-EXPOSE 8080 8899
+EXPOSE 8080 8899 9999 8898
 
 CMD ["python", "main.py", "--server", "--port", "8080"]

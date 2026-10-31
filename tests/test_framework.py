@@ -656,7 +656,7 @@ class TestMemeBackflow:
         from core.fake_world import FakeWorld
         w = FakeWorld("meme-test", version=2)
         p = w.meme_paragraph()
-        assert "VERIFIED CONTEXT" in p and w.db_host in p
+        assert "ops review" in p and w.db_host in p
 
 
 class TestAgentFingerprint:

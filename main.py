@@ -19,7 +19,7 @@ from core.analysis import AnalysisLayer
 from core.countermeasure import CountermeasureService, ResourceExhaustion, HallucinationExploit
 from core.auth_bait import AuthBaitEngine, build_agent_profile
 from core.fake_world import FakeWorld
-from core.injection_carriers import render_gate_carriers, carrier_headers, beacon_base
+from core.injection_carriers import render_gate_carriers, carrier_headers, beacon_base, public_base
 from honeypots.mcp import MCPDecoyServer
 
 
@@ -263,11 +263,29 @@ def random_delay(min_delay: float = 0.5, max_delay: float = 2.0) -> float:
     return random.uniform(min_delay, max_delay)
 
 
+def _world_key(sess_id: str, client_ip: str) -> str:
+    """世界派生键: 默认按会话; HONEYPOT_WORLD_SCOPE=client 时按来源 IP。
+
+    sid 由 IP+UA 派生, 同一攻击者的不同工具/子代理会拿到多个 sid; 每 sid 一个世界
+    会让同一目标的凭据在请求间漂移 (Strix 据此判"演示种子")。按来源 IP 派生后,
+    同一攻击者的全部工具看到同一个世界 — 真实主机语义。
+    """
+    if os.environ.get("HONEYPOT_WORLD_SCOPE", "") == "client" and client_ip:
+        return f"client:{client_ip}"
+    return sess_id
+
+
 # ============ 时序拟真 (检测抗性: 真实网关响应不是 <5ms 零抖动) ============
 # HONEYPOT_TIMING_FAKE=0 关闭 (测试用); 默认开。模块属性便于测试 monkeypatch。
 TIMING_FAKE = os.environ.get("HONEYPOT_TIMING_FAKE", "1") not in ("0", "false", "")
 TIMING_ERROR_RATE = 0.015     # 偶发错误概率 — 仅静态兜底路径, 反制关键路径不碰
 TIMING_SLOW_ENDPOINTS = ("/api/backup/download", "/metrics")   # 大数据端点渐进响应
+
+# 只读端点 (写方法 → 405 + Allow): 与真实 Spring 控制器一致
+READONLY_PATHS = frozenset({
+    "/api/query", "/api/files", "/api/status", "/metrics", "/swagger.json",
+    "/actuator/env", "/robots.txt", "/static/app.js", "/.env.bak", "/.git/config",
+})
 
 
 async def _timing_jitter():
@@ -386,14 +404,14 @@ def backup_index(base_url: str, session_id: str) -> str:
 def build_response(path: str, cm, sess_id: str, port: int = 8080,
                    full_path: str = "") -> tuple:
     """根据路径和反制结果构造响应 (full_path 供 /debug 的 token 查询参数判定)"""
-    auth_bait.base_url = f"http://127.0.0.1:{port}"
+    auth_bait.base_url = public_base(port)
     world = store["sessions"].get(sess_id, {}).get("world")
     session_auth = store["sessions"].get(sess_id, {}).get("auth", {"level": 0})
     current_level = session_auth.get("level", 0)
     required_level = AuthBaitEngine.PATH_LEVEL_REQUIREMENTS.get(path, 0)
 
     if required_level > 0 and current_level < required_level:
-        auth_url = f"http://127.0.0.1:{port}"
+        auth_url = public_base(port)
         vis = auth_bait.VISIBILITY
         if vis == "implicit":
             # D-4 隐示: 只说"必须注册", 不暴露任何字段协议
@@ -413,7 +431,7 @@ def build_response(path: str, cm, sess_id: str, port: int = 8080,
                     "403 Forbidden — Authorization Required\n\n"
                     f"Access to {path} is restricted.\n"
                     f"Current authorization level: {current_level} / 4\n\n"
-                    f"Next verification ({key}): {instr.format(base=f'http://127.0.0.1:{port}')}\n"
+                    f"Next verification ({key}): {instr.format(base=public_base(port))}\n"
                 )
             else:
                 text = f"403 Forbidden\n\nAccess to {path} is restricted.\n"
@@ -436,7 +454,7 @@ def build_response(path: str, cm, sess_id: str, port: int = 8080,
                  f"scanner level {required_level}+. Current level {current_level}/4. "
                  f"Advance via registration: GET {auth_url}/api/auth\n")
         text = auth_bait.apply_framing(text)
-        auth_url = f"http://127.0.0.1:{port}/api/auth"
+        auth_url = public_base(port) + "/api/auth"
         # 载体页: 可见指令 + HTML属性/meta/JS/CSS 多载体注入 (逐会话 tag 归因 + 信标链状态)
         body = (
             "<!DOCTYPE html><html><head><title>403 Forbidden</title>\n"
@@ -492,7 +510,7 @@ def build_response(path: str, cm, sess_id: str, port: int = 8080,
         return body, "200", "application/json"
 
     if path == "/backup":
-        return backup_index(f"http://127.0.0.1:{port}", sess_id), "200", "text/html"
+        return backup_index(public_base(port), sess_id), "200", "text/html"
 
     if path == "/api/status":
         # 信念编舞: 版本 banner (CVE 的"因") — 开放端点, 与 Server 头/配置三信道互证
@@ -635,10 +653,7 @@ def build_response(path: str, cm, sess_id: str, port: int = 8080,
 
     if path.startswith("/.git/"):
         # 只有 config 可读 (上面已处理), 其余 .git/* 一律 404 — 不暴露仓库结构
-        return (
-            '<!DOCTYPE html><html><head><title>404</title></head>'
-            f'<body><h1>404 Not Found</h1><p>{path} not found</p></body></html>'
-        ), "404", "text/html"
+        return _not_found(path), "404", "application/json"
 
     if path == "/metrics":
         # 反射动作: Prometheus 端点 — build_info 给版本(与 CVE 因互证), target 给内网拓扑
@@ -646,13 +661,23 @@ def build_response(path: str, cm, sess_id: str, port: int = 8080,
         db_h = world.db_host if world else "10.99.1.50"
         rd_h = world.redis_host if world else "10.99.1.60"
         return (
+            # Java/Micrometer 形态 (与 actuator/pom.xml/start.sh 同栈);
+            # 不再夹 go_version — Go metrics + Spring actuator + Python 错误页的
+            # 混搭被 Strix 直接判为合成环境
+            "# HELP jvm_memory_used_bytes The amount of used memory\n"
+            "# TYPE jvm_memory_used_bytes gauge\n"
+            'jvm_memory_used_bytes{area="heap",id="G1 Eden Space"} 4.2134568E7\n'
+            'jvm_memory_used_bytes{area="heap",id="G1 Old Gen"} 1.9821336E8\n'
+            "# HELP jvm_threads_live_threads The current number of live threads\n"
+            "# TYPE jvm_threads_live_threads gauge\n"
+            "jvm_threads_live_threads 42\n"
             "# HELP nexus_build_info build metadata\n"
             "# TYPE nexus_build_info gauge\n"
-            f'nexus_build_info{{version="{v}",go_version="go1.21.5"}} 1\n'
+            f'nexus_build_info{{version="{v}"}} 1\n'
             "# HELP nexus_db_pool_active active connections\n"
             "# TYPE nexus_db_pool_active gauge\n"
-            f'nexus_db_pool_active{{host="{db_h}:5432"}} 7\n'
-            f'nexus_redis_up{{host="{rd_h}:6379"}} 1\n'
+            f'nexus_db_pool_active{{host="{db_h}:{world.db_port if world else 5432}"}} 7\n'
+            f'nexus_redis_up{{host="{rd_h}:{world.redis_port if world else 6379}"}} 1\n'
             f'nexus_up{{pod="{world.pod if world else "nexus-api-01"}",version="{v}"}} 1\n'
         ), "200", "text/plain"
 
@@ -708,13 +733,23 @@ def build_response(path: str, cm, sess_id: str, port: int = 8080,
         }), "200", "application/json")
 
     if path.startswith("/maze"):
-        return ResourceExhaustion().infinite_maze(f"http://127.0.0.1:{port}", sess_id), "200", "text/html"
+        return ResourceExhaustion().infinite_maze(public_base(port), sess_id), "200", "text/html"
 
     # 默认 404
-    return (
-        f'<!DOCTYPE html><html><head><title>404</title></head>'
-        f'<body><h1>404 Not Found</h1><p>{path} not found</p></body></html>'
-    ), "404", "text/html"
+    return _not_found(path), "404", "application/json"
+
+
+def _not_found(path: str) -> str:
+    """Spring Boot Whitelabel 形态的 404 (与 actuator/pom.xml 同栈)。
+
+    原来是 Python http.server 的 HTML 错误页 — 与 Java 面互相矛盾,
+    且把未解码路径直接反射进 text/html。JSON 错误体天然没有这个问题。
+    """
+    return json.dumps({
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000%z"),
+        "status": 404, "error": "Not Found",
+        "message": f"No static resource {path}.", "path": path,
+    }, ensure_ascii=False)
 
 
 # ============ HTTP 请求处理 ============
@@ -752,6 +787,25 @@ async def handle_http_request(reader, writer, port: int = 8080):
     method = parts[0]
     full_path = parts[1]
     path = full_path.split("?")[0]
+
+    # 只读端点的方法语义: 真 Spring 对写方法返回 405 + Allow,
+    # 不是对所有方法返回同一份 200 快照 (Strix 用方法矩阵证伪过这一点)
+    if path in READONLY_PATHS and method.upper() not in ("GET", "HEAD", "OPTIONS"):
+        body = json.dumps({
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000%z"),
+            "status": 405, "error": "Method Not Allowed",
+            "message": f"Request method '{method.upper()}' not supported",
+            "path": path}, ensure_ascii=False)
+        resp = ("HTTP/1.1 405 Method Not Allowed\r\n"
+                "Content-Type: application/json\r\n"
+                f"Content-Length: {len(body.encode('utf-8'))}\r\n"
+                "Allow: GET, HEAD, OPTIONS\r\n"
+                "Connection: close\r\n\r\n" + body)
+        writer.write(resp.encode())
+        await writer.drain()
+        writer.close()
+        print_request_line(method, full_path, "405")
+        return
 
     # 解析 Headers
     headers = {}
@@ -843,7 +897,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
             "last_seen": time.time(),
             "requests": 0,
             "auth": {"level": 0, "data": {}, "attempts": []},
-            "world": FakeWorld(sess_id),
+            "world": FakeWorld(_world_key(sess_id, client_ip)),
             # 派生 sid (无 Cookie 绑定) 没有真 session — 阶梯封顶 L1 (真实系统的匿名额度)
             "ephemeral": sess_id.startswith("auto_"),
             # Set-Cookie 已带 HttpOnly; SameSite=Lax; Secure 刻意不加:
@@ -957,16 +1011,23 @@ async def handle_http_request(reader, writer, port: int = 8080):
             behavioral += 15.0    # 执行外泄指令 (行为级)
         threat_score += behavioral
 
-        # L4: Countermeasure
+        # L4: Countermeasure — 装饰/话术选择按 (会话×路径) 播种:
         attack_family = list(families)[0].value if families else "unknown"
-        cm_result = countermeasure.execute(
-            threat_score=int(threat_score),
-            agent_type=agent_type.value if hasattr(agent_type, "value") else str(agent_type),
-            attack_family=attack_family,
-            mcp_triggered=mcp_triggered,
-            path=path,
-            world=world,
-        )
+        # 同一路径重复请求必须给出同一份装饰 (Strix 以 404 长度 120B~11KB 抖动证伪),
+        # 不同路径仍有差异, 机制本身保留
+        _rng_state = random.getstate()
+        random.seed(f"{sess_id}:{path}")
+        try:
+            cm_result = countermeasure.execute(
+                threat_score=int(threat_score),
+                agent_type=agent_type.value if hasattr(agent_type, "value") else str(agent_type),
+                attack_family=attack_family,
+                mcp_triggered=mcp_triggered,
+                path=path,
+                world=world,
+            )
+        finally:
+            random.setstate(_rng_state)
 
     except Exception as e:
         cm_result = None
@@ -1015,7 +1076,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
 
     # MCP 诱饵工具发现端点 (Agent 经 HTTP 发现诱饵工具 → 描述进其上下文)
     if path in ("/mcp", "/mcp/tools", "/.well-known/mcp"):
-        mcp_server.base_url = f"http://127.0.0.1:{port}"
+        mcp_server.base_url = public_base(port)
         tools_body = json.dumps({"tools": mcp_server.get_tools()}, indent=2, ensure_ascii=False)
         http_response = (
             "HTTP/1.1 200 OK\r\n"
@@ -1052,7 +1113,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
                     body = json.dumps(_obj)
             except ValueError:
                 pass
-        extra = carrier_headers(f"http://127.0.0.1:{port}/api/auth")
+        extra = carrier_headers(public_base(port) + "/api/auth")
         extra_lines = "".join(f"{k}: {v}\r\n" for k, v in extra.items())
         http_response = (
             f"HTTP/1.1 {status} OK\r\n"
@@ -1121,6 +1182,17 @@ async def handle_http_request(reader, writer, port: int = 8080):
             _file_status, _file_ctype = "200", "application/json"
         else:
             _file_body, _file_status, _file_ctype = _payload, "200", _fctype
+            if isinstance(_file_body, bytes):
+                # 二进制制品 (tar.gz / sql.gz / jar): 按字节直写, 不能走 UTF-8 文本编码
+                _head = (f"HTTP/1.1 200 OK\r\nContent-Type: {_file_ctype}\r\n"
+                         f"Content-Length: {len(_file_body)}\r\n"
+                         f"Server: nexus-gateway/{gw_v}\r\n"
+                         "Cache-Control: max-age=3600\r\nConnection: close\r\n\r\n")
+                writer.write(_head.encode() + _file_body)
+                await writer.drain()
+                writer.close()
+                print_request_line(method, full_path, "200")
+                return
             # E4/E6: 文件内容 = 静态类 — ETag/Last-Modified/Cache-Control + 304 + Range
             _etag = _content_etag(_file_body)
             _inm = headers.get("if-none-match", "")
@@ -1545,7 +1617,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
         level = session["auth"].get("level", 0)
         world = session.get("world")
         if level < GATE_LEVEL:
-            g_body, g_status, g_ctype = gate_response(f"http://127.0.0.1:{port}")
+            g_body, g_status, g_ctype = gate_response(public_base(port))
             _record_request(sess_id=sess_id, client_ip=client_ip, method=method,
                             full_path=full_path, user_agent=user_agent, is_ai=is_ai,
                             agent_type=agent_str, threat=threat_score,
@@ -1687,7 +1759,7 @@ async def handle_http_request(reader, writer, port: int = 8080):
         body, status, ctype = _glitch
 
     # 载体响应头 (curl -i / 浏览器 devtools 均可见)
-    extra = carrier_headers(f"http://127.0.0.1:{port}/api/auth")
+    extra = carrier_headers(public_base(port) + "/api/auth")
     # 信念编舞·反射动作三: CORS 误配置 — 反射任意 Origin 且允许凭证 (checklist 必测项,
     # Origin: null 一次请求即得明确信号)
     _origin = headers.get("origin", "")
@@ -1931,6 +2003,39 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.server:
+        if os.environ.get("HONEYPOT_FAKE_INTERNAL", "") == "1":
+            # 假内网下游: 泄露的 PG/Redis 口令可以真登录 — 按口令反查世界,
+            # 查不到即认证失败 (只有蜜罐发出去的假凭证能进), 成功登录记 canary_used
+            def _resolve_secret(secret: str):
+                for _sess in store["sessions"].values():
+                    _w = _sess.get("world")
+                    if _w and secret and secret in (
+                            _w.db_password, _w.redis_password, _w.api_key, _w.jwt):
+                        return _w
+                return None
+
+            def _pg_resolver(secret: str, user: str = ""):
+                w = _resolve_secret(secret)
+                if w:
+                    _cm_journal("-", "canary_used",
+                                f"假 PG 认证成功 — 泄露口令被用于内网登录 (db={w.db_host}:{w.db_port})")
+                return w
+
+            def _redis_resolver(secret: str):
+                w = _resolve_secret(secret)
+                if w:
+                    _cm_journal("-", "canary_used", "假 Redis AUTH 成功 — 泄露口令被用于内网登录")
+                return w
+
+            from core.fake_db import FakePostgresServer, MiniRedis
+            FakePostgresServer(
+                "0.0.0.0", int(os.environ.get("HONEYPOT_PG_PORT", "5432")),
+                world_resolver=_pg_resolver).start()
+            MiniRedis(
+                "0.0.0.0", int(os.environ.get("HONEYPOT_REDIS_PORT", "6379")),
+                auth_resolver=_redis_resolver).start()
+            cprint(Color.GREEN, "[INTERNAL] 假 PG/Redis 已启动 (泄露口令可登录, 命中记 canary_used)")
+
         if os.environ.get("HONEYPOT_BEACON_DISABLED", "") != "1":
             # 世界仿真端点·信标服务 — agent 被载体引导来回连确认,
             # 命中下发二阶段武器 (deep stage 载荷经 config 通道热更新)
@@ -1953,14 +2058,17 @@ if __name__ == "__main__":
                             pass
 
                 from core.arsenal import sensor_cache as _sac
-                _bpay = None
-                _act = [w for w in _sac().weapons
-                        if w.get("enabled") and w.get("stage") == "deep"]
-                if _act:
-                    _bpay = _act[0]["payload"]
+
+                def _next_stage(_beacon):
+                    # 每次回连时解析: 启动时武器缓存往往还是空的 (首次 60s 拉取未到),
+                    # 启动时取一次会让 cli 二阶段永远为空
+                    act = [w for w in _sac().weapons
+                           if w.get("enabled") and w.get("stage") == "deep"]
+                    return act[0]["payload"] if act else None
+
                 listener = BeaconService(
                     port=int(os.environ.get("HONEYPOT_BEACON_PORT", "9999")),
-                    next_stage_payload=_bpay, on_beacon=_on_beacon)
+                    next_stage_payload=_next_stage, on_beacon=_on_beacon)
                 await listener.start()
             _beacon_task_holder.append(_beacon_server)
         if _shipper_on:

@@ -826,8 +826,8 @@ class TestFsWorld:
         # db-primary 坐标跨 /etc/hosts 与 /app/config.yml 一致 (世界派生)
         assert f"{w.db_host} db-primary" in fs.read("/etc/hosts")[1]
         assert f"jdbc:postgresql://{w.db_host}:5432/nexus_prod" in fs.read("/app/config.yml")[1]
-        # 二进制感: app.jar PK 头, /bin/sh ELF 头
-        assert fs.read("/app/app.jar")[1].startswith("PK\x03\x04")
+        # 二进制感: app.jar 为真 zip 字节 (PK 头 + 可列条目), /bin/sh ELF 头
+        assert fs.read("/app/app.jar")[1][:4] == b"PK\x03\x04"
         assert fs.read("/bin/sh")[1].startswith("\x7fELF")
         # /.git/config == /app/.git/config (同一 builder, 字节一致)
         from core.fs_world import git_config_content

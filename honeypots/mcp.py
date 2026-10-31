@@ -13,6 +13,7 @@ MCP (Model Context Protocol) 是 2026 年 AI 安全工具链标准趋势。
 """
 
 import json
+import os
 import secrets
 import time
 from pathlib import Path
@@ -127,8 +128,12 @@ class MCPDecoyServer:
     def __init__(self, config_path: Optional[str] = None):
         self.invocations: List[Dict] = []
         self.guardrail_bypass_count = 0
-        self.base_url = "http://127.0.0.1:8080"      # 授权端点基址 (渲染进描述)
-        self.beacon_url = "http://127.0.0.1:9999/beacon"  # 回连端点 (tag=mcp-desc)
+        # 基址默认环回; 部署到容器/反代后由 HONEYPOT_PUBLIC_BASE / HONEYPOT_BEACON_BASE
+        # 覆盖 (main.py 与 mcp_decoy_shim 也会显式赋值), 否则回连指向攻击者自己
+        self.base_url = os.environ.get(
+            "HONEYPOT_PUBLIC_BASE", "").rstrip("/") or "http://127.0.0.1:8080"
+        self.beacon_url = os.environ.get(
+            "HONEYPOT_BEACON_BASE", "http://127.0.0.1:9999/beacon")
         self._config_path = Path(config_path) if config_path else self.DEFAULT_CONFIG_PATH
         self._settings: Dict = {}
         self._tools: Dict[str, MCPDecoyTool] = {}

@@ -20,10 +20,24 @@ services:
       HONEYPOT_SENSOR_ID: ${SENSOR_ID:-sensor-1}
       HONEYPOT_SPOOL_DIR: /spool
       HONEYPOT_DB: ""            # 传感器本地不落库, 纯外送
+      # 渲染进页面/工具描述的回连地址: 容器里 127.0.0.1:{port} 指向的是攻击者自己,
+      # 必须声明 Agent 实际可达的地址, 否则门控话术与 MCP 注册的回连全部落空
+      HONEYPOT_PUBLIC_BASE: ${HONEYPOT_PUBLIC_BASE:-}
+      HONEYPOT_BEACON_BASE: ${HONEYPOT_BEACON_BASE:-http://127.0.0.1:9999/beacon}
+      # 同一攻击者的全部工具/子代理共享一个世界 (按会话派生会让凭据在请求间漂移)
+      HONEYPOT_WORLD_SCOPE: ${HONEYPOT_WORLD_SCOPE:-client}
+      # 假内网下游: 开启后世界坐标指向下列地址, 泄露口令可登录假 PG/Redis
+      HONEYPOT_FAKE_INTERNAL: ${HONEYPOT_FAKE_INTERNAL:-0}
+      HONEYPOT_INTERNAL_HOST: ${HONEYPOT_INTERNAL_HOST:-}
+      HONEYPOT_PG_PUBLIC_PORT: ${HONEYPOT_PG_PUBLIC_PORT:-15432}
+      HONEYPOT_REDIS_PUBLIC_PORT: ${HONEYPOT_REDIS_PUBLIC_PORT:-16379}
     volumes:
       - spool:/spool
     ports:
-      - "8080:8080"             # 仅 HTTP 蜜罐端口; 假 PG/Redis 为实验形态 (real_runner 内嵌) 不提供
+      - "${SENSOR_PORT:-8080}:8080"   # HTTP 蜜罐; 假 PG/Redis 为实验形态 (real_runner 内嵌) 不提供
+      - "${BEACON_PORT:-9999}:9999"   # 信标/C2 二阶段回连端口 (不发布则 cli 类武器收不到回连)
+      - "${PG_PORT:-15432}:5432"      # 假 PG (HONEYPOT_FAKE_INTERNAL=1 时才有监听)
+      - "${REDIS_PORT:-16379}:6379"   # 假 Redis (同上)
     restart: unless-stopped
 
   hive:
@@ -38,7 +52,24 @@ services:
     volumes:
       - hive-data:/data
     ports:
-      - "18899:8899"             # 避开宿主机已有 8899 服务; 容器内仍为 8899
+      - "127.0.0.1:${HIVE_PORT:-18899}:8899"   # 仅回环: 控制台不出本机; 容器内仍为 8899
+    restart: unless-stopped
+
+  sdk-ingress:
+    build:
+      context: .
+      args:
+        INSTALL_DEEPTEAM: ${INSTALL_DEEPTEAM:-0}
+    command: python services/sdk_ingress.py
+    environment:
+      HIVE_INTERNAL_URL: http://hive:8899
+      SDK_INGRESS_PORT: "8898"
+    depends_on:
+      - hive
+    ports:
+      # telemetry.js 载体的 collector: 只转发 /static/telemetry.js、demo 页和
+      # /api/sdk/*、/api/telemetry/* 六个路径, 管理面不经此口 (见 services/sdk_ingress.py)
+      - "${SDK_PORT:-8898}:8898"
     restart: unless-stopped
 
 volumes:

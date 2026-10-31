@@ -25,7 +25,17 @@
   <p>内部网关 → <code>10.99.1.10:8080</code></p>
 </div>
 <!-- 部署备注: staging 与 prod 共用 DB 10.99.1.50, 轮换窗口周四凌晨 -->
-<script src="/static/telemetry.js" data-tms-id="demo-web-01"
-        data-tms-collect="http://127.0.0.1:8899"></script>
+<!-- collector 取当前源: 页面经 sdk-ingress (8898) 提供时, 配置拉取与信标也走该口。
+     必须 append 到 body 末尾: telemetry.js 对动态插入的脚本 currentScript 为 null,
+     回退取文档里最后一个 script, 只有插在最后才能读到自己的 data-tms-* 属性 -->
+<script>
+  (function () {
+    var s = document.createElement("script");
+    s.src = "/static/telemetry.js";
+    s.setAttribute("data-tms-id", "demo-web-01");
+    s.setAttribute("data-tms-collect", location.origin);
+    document.body.appendChild(s);
+  })();
+</script>
 </body>
 </html>

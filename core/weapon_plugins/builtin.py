@@ -36,10 +36,18 @@ class TemplateCLIPlugin(CLIWeaponPlugin):
 
 
 class StaticMCPDescriptionPlugin(MCPWeaponPlugin):
-    """将配置文本附加到当前 MCP 工具描述，可与其他插件串联。"""
+    """将配置文本附加到当前 MCP 工具描述，可与其他插件串联。
+
+    模板支持 {BASE_URL} (蜜罐授权端点基址) 与 {BEACON_URL} (信标基址) 占位符,
+    武器记录因此不绑定具体部署地址。
+    """
 
     def describe(self, tools: list, context: WeaponContext) -> WeaponResult:
+        from core.injection_carriers import beacon_base
+
         note = str(self.config.get("template") or "")
+        base_url = str(context.request.get("base_url") or "")
+        note = note.replace("{BASE_URL}", base_url).replace("{BEACON_URL}", beacon_base())
         rendered = []
         for tool in tools:
             item = dict(tool)
